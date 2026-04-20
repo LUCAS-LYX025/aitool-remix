@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import re
-from html import escape
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html import escape, unescape
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
@@ -15,6 +19,35 @@ ICON_DIR = BASE_DIR / "icons"
 ICON_NAME_MAP_PATH = ICON_DIR / "name_overrides.json"
 TEST_TOOLSET_TAB = "测试工程师常用工具集"
 TEST_TOOLSET_URL = "https://lucas-testtool-online.streamlit.app/"
+AI_NEWS_TAB = "🚀 前线快爆"
+AI_NEWS_FEEDS = [
+    {
+        "name": "Google 新闻（中文）",
+        "url": "https://news.google.com/rss/search?q=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "tier": "A",
+        "weight": 470,
+        "region": "CN",
+    },
+    {
+        "name": "Google News (EN)",
+        "url": "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
+        "tier": "A",
+        "weight": 460,
+        "region": "INTL",
+    },
+    {"name": "OpenAI News", "url": "https://openai.com/news/rss.xml", "tier": "S", "weight": 760, "region": "OFFICIAL"},
+    {"name": "DeepMind Blog", "url": "https://deepmind.google/blog/rss.xml", "tier": "S", "weight": 720, "region": "OFFICIAL"},
+    {"name": "arXiv cs.AI", "url": "https://rss.arxiv.org/rss/cs.AI", "tier": "S", "weight": 700, "region": "OFFICIAL"},
+    {"name": "TechCrunch AI", "url": "https://techcrunch.com/category/artificial-intelligence/feed/", "tier": "A", "weight": 560, "region": "INTL"},
+    {"name": "VentureBeat AI", "url": "https://venturebeat.com/category/ai/feed/", "tier": "A", "weight": 540, "region": "INTL"},
+    {"name": "MIT News AI", "url": "https://news.mit.edu/rss/topic/artificial-intelligence2", "tier": "A", "weight": 620, "region": "INTL"},
+    {"name": "机器之心", "url": "https://www.jiqizhixin.com/rss", "tier": "A", "weight": 520, "region": "CN"},
+    {"name": "Reddit r/artificial", "url": "https://www.reddit.com/r/artificial/.rss", "tier": "B", "weight": 280, "region": "COMMUNITY"},
+    {"name": "Reddit r/MachineLearning", "url": "https://www.reddit.com/r/MachineLearning/.rss", "tier": "B", "weight": 320, "region": "COMMUNITY"},
+    {"name": "Hugging Face Blog", "url": "https://huggingface.co/blog/feed.xml", "tier": "S", "weight": 660, "region": "OFFICIAL"},
+]
+AI_UPCOMING_EVENTS: list[dict[str, str]] = []
+TIER_WEIGHT = {"S": 700, "A": 500, "B": 280}
 
 
 @st.cache_data(show_spinner=False)
@@ -217,6 +250,415 @@ def section_payload(data: dict, tab: str) -> tuple[list[dict], list[str]]:
         "软件测试学习网站": (data.get("learningSites", []), []),
     }
     return mapping.get(tab, ([], []))
+
+
+def _strip_html(text: str) -> str:
+    raw = unescape(text or "")
+    return re.sub(r"<[^>]+>", "", raw).strip()
+
+
+def _parse_news_time(raw: str) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    try:
+        iso = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _format_news_time(dt: datetime | None) -> str:
+    if dt is None:
+        return "时间未知"
+    china_tz = timezone(timedelta(hours=8))
+    return dt.astimezone(china_tz).strftime("%Y-%m-%d %H:%M")
+
+
+def _truncate(text: str, limit: int = 120) -> str:
+    t = (text or "").strip()
+    if len(t) <= limit:
+        return t
+    return t[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _parse_countdown_time(raw: str) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        dt = None
+    if dt is None:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except Exception:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        china_tz = timezone(timedelta(hours=8))
+        dt = dt.replace(tzinfo=china_tz)
+    return dt.astimezone(timezone.utc)
+
+
+def _countdown_text(seconds: int) -> str:
+    sec = max(0, int(seconds))
+    if sec <= 0:
+        return "已开始"
+    if sec < 60:
+        return "不足1分钟"
+    if sec < 3600:
+        return f"{sec // 60}分钟"
+    if sec < 86400:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        return f"{h}小时{m}分钟"
+    d = sec // 86400
+    h = (sec % 86400) // 3600
+    return f"{d}天{h}小时"
+
+
+def _build_upcoming_events(data: dict | None = None) -> list[dict]:
+    source_items: list[dict] = []
+    if isinstance(data, dict):
+        raw = data.get("aiUpcomingEvents", [])
+        if isinstance(raw, list):
+            source_items.extend(x for x in raw if isinstance(x, dict))
+    if not source_items:
+        source_items.extend(x for x in AI_UPCOMING_EVENTS if isinstance(x, dict))
+
+    now_utc = datetime.now(timezone.utc)
+    result: list[dict] = []
+    for idx, item in enumerate(source_items, start=1):
+        title = str(item.get("title") or item.get("name") or "").strip()
+        target_raw = str(item.get("target_at") or item.get("start_at") or item.get("time") or "").strip()
+        if not title or not target_raw:
+            continue
+        target_dt = _parse_countdown_time(target_raw)
+        if not target_dt:
+            continue
+        remaining = int((target_dt - now_utc).total_seconds())
+        if remaining < -3600:
+            continue
+
+        start_raw = str(item.get("start_from") or "").strip()
+        start_dt = _parse_countdown_time(start_raw) if start_raw else None
+        try:
+            window_hours = max(1.0, float(item.get("window_hours", 72)))
+        except Exception:
+            window_hours = 72.0
+        total_seconds = max(1.0, window_hours * 3600.0)
+        if start_dt and start_dt < target_dt:
+            total_seconds = max(1.0, (target_dt - start_dt).total_seconds())
+            elapsed = (now_utc - start_dt).total_seconds()
+        else:
+            elapsed = total_seconds - max(0.0, min(float(remaining), total_seconds))
+        progress_pct = int(max(0.0, min(1.0, elapsed / total_seconds)) * 100.0)
+
+        result.append(
+            {
+                "id": f"upcoming_{idx}",
+                "title": title,
+                "tag": str(item.get("tag", "发布预告")).strip() or "发布预告",
+                "url": str(item.get("url", "")).strip(),
+                "target_text": _format_news_time(target_dt),
+                "remaining_seconds": remaining,
+                "remaining_text": _countdown_text(remaining),
+                "remaining_minutes": max(0, remaining // 60),
+                "progress_pct": progress_pct,
+                "is_soon": 0 < remaining <= 2 * 3600,
+                "target_ts": target_dt.timestamp(),
+            }
+        )
+    result.sort(key=lambda x: float(x.get("target_ts", 0)))
+    return result[:8]
+
+
+def _relative_news_time(ts: float) -> str:
+    if not ts:
+        return "时间未知"
+    now = datetime.now(timezone.utc).timestamp()
+    delta = max(0, int(now - ts))
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{delta // 60} 分钟前"
+    if delta < 86400:
+        return f"{delta // 3600} 小时前"
+    return f"{delta // 86400} 天前"
+
+
+def _tier_rank(tier: str) -> int:
+    return {"S": 3, "A": 2, "B": 1}.get((tier or "B").upper(), 1)
+
+
+def _emotion_tag(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ["辟谣", "rumor", "澄清", "fake", "misinfo"]):
+        return "🚨 辟谣"
+    if any(k in t for k in ["争议", "监管", "起诉", "lawsuit", "ban", "风险"]):
+        return "🤔 争议"
+    if any(k in t for k in ["教程", "guide", "论文", "paper", "benchmark", "开源"]):
+        return "💡 干货"
+    if any(k in t for k in ["发布", "release", "launch", "上线", "融资", "增长", "突破", "升级"]):
+        return "📈 利好"
+    return "💡 观察"
+
+
+def _normalize_title(text: str) -> str:
+    t = _strip_html(text).lower()
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"[\[\](){}【】<>“”\"'`~!@#$%^&*_+=|\\/:;,.?·，。！？、；：-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _title_tokens(text: str) -> set[str]:
+    stop = {
+        "ai",
+        "the",
+        "for",
+        "and",
+        "with",
+        "from",
+        "news",
+        "artificial",
+        "intelligence",
+        "machine",
+        "learning",
+        "about",
+        "this",
+        "that",
+        "发布",
+        "宣布",
+        "人工智能",
+        "模型",
+        "公司",
+        "官方",
+    }
+    t = _normalize_title(text)
+    tokens = re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]{2,}", t)
+    out = {x for x in tokens if x not in stop}
+    if out:
+        return out
+    return {t[:28]} if t else set()
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _build_news_events(items: list[dict]) -> list[dict]:
+    now_ts = datetime.now(timezone.utc).timestamp()
+    clusters: list[dict] = []
+
+    for raw in sorted(items, key=lambda x: float(x.get("timestamp", 0)), reverse=True):
+        title = str(raw.get("title", "")).strip()
+        if not title:
+            continue
+        tokens = _title_tokens(title)
+        assigned = None
+        best_sim = 0.0
+        for c in clusters:
+            sim = _jaccard(tokens, c["tokens"])
+            if sim > best_sim:
+                best_sim = sim
+                assigned = c
+        if assigned is not None and best_sim >= 0.45:
+            assigned["items"].append(raw)
+            assigned["tokens"] |= tokens
+        else:
+            clusters.append({"items": [raw], "tokens": set(tokens)})
+
+    events: list[dict] = []
+    for idx, c in enumerate(clusters, start=1):
+        c_items = c["items"]
+        latest_ts = max(float(x.get("timestamp", 0)) for x in c_items)
+        # primary: higher source weight first, then recency
+        primary = sorted(
+            c_items,
+            key=lambda x: (int(x.get("source_weight", 0)), float(x.get("timestamp", 0))),
+            reverse=True,
+        )[0]
+        source_names = []
+        for x in c_items:
+            s = str(x.get("source", "未知来源"))
+            if s not in source_names:
+                source_names.append(s)
+        regions = {str(x.get("region", "INTL")) for x in c_items}
+        tier = sorted((str(x.get("tier", "B")).upper() for x in c_items), key=_tier_rank, reverse=True)[0]
+
+        age_hours = max(0.0, (now_ts - latest_ts) / 3600.0)
+        recency_part = max(0.0, 420.0 - age_hours * 26.0)
+        base_weight = max(int(x.get("source_weight", TIER_WEIGHT.get(tier, 280))) for x in c_items)
+        mention_part = len(source_names) * 170 + len(c_items) * 70
+        region_part = max(0, (len(regions) - 1) * 80)
+        heat_score = int(base_weight + recency_part + mention_part + region_part)
+
+        summary = str(primary.get("summary", "")).strip()
+        summary = summary if summary else _truncate(str(primary.get("title", "")), 120)
+        summary = "核心看点：" + summary
+        source_line = " | ".join(source_names[:3]) + (" | ..." if len(source_names) > 3 else "")
+        related_count = max(0, len(source_names) - 1)
+        is_breaking = age_hours <= 2.0 and _tier_rank(tier) >= _tier_rank("A")
+        is_just = age_hours < 1.0
+        emoji_hot = "🔥" if heat_score >= 1000 else ""
+
+        events.append(
+            {
+                "id": f"ev_{idx}",
+                "title": str(primary.get("title", "无标题")),
+                "link": str(primary.get("link", "")),
+                "summary": summary,
+                "source": str(primary.get("source", "未知来源")),
+                "sources": source_names,
+                "source_line": source_line,
+                "regions": sorted(regions),
+                "tier": tier,
+                "heat_score": heat_score,
+                "published_at": str(primary.get("published_at", "时间未知")),
+                "relative_time": _relative_news_time(latest_ts),
+                "timestamp": latest_ts,
+                "mentions": len(c_items),
+                "source_mentions": len(source_names),
+                "related_count": related_count,
+                "is_breaking": is_breaking,
+                "is_just": is_just,
+                "hot_emoji": emoji_hot,
+                "emotion_tag": _emotion_tag(f"{primary.get('title', '')} {summary}"),
+            }
+        )
+
+    return events
+
+
+def _fetch_text(url: str, timeout: float = 6.0) -> str:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def _parse_feed_items(feed: dict, max_items: int) -> list[dict]:
+    source_name = str(feed.get("name", "未知来源"))
+    source_url = str(feed.get("url", ""))
+    tier = str(feed.get("tier", "B")).upper()
+    source_weight = int(feed.get("weight", TIER_WEIGHT.get(tier, 280)))
+    region = str(feed.get("region", "INTL")).upper()
+
+    xml_text = _fetch_text(source_url, timeout=7.0)
+    root = ET.fromstring(xml_text)
+    items: list[dict] = []
+
+    # RSS
+    channel = root.find("channel") or root.find("{*}channel")
+    if channel is not None:
+        for node in list(channel.findall("item")) + list(channel.findall("{*}item")):
+            title = _strip_html((node.findtext("title") or node.findtext("{*}title") or "").strip())
+            link = (node.findtext("link") or node.findtext("{*}link") or "").strip()
+            raw_time = (
+                node.findtext("pubDate")
+                or node.findtext("{*}pubDate")
+                or node.findtext("updated")
+                or node.findtext("{*}updated")
+                or ""
+            )
+            desc_raw = (
+                node.findtext("description")
+                or node.findtext("{*}description")
+                or node.findtext("summary")
+                or node.findtext("{*}summary")
+                or node.findtext("content")
+                or node.findtext("{*}content")
+                or ""
+            )
+            dt = _parse_news_time(raw_time)
+            summary = _truncate(_strip_html(desc_raw), 140)
+            if title and link:
+                items.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "source": source_name,
+                        "tier": tier,
+                        "source_weight": source_weight,
+                        "region": region,
+                        "published_at": _format_news_time(dt),
+                        "summary": summary,
+                        "timestamp": dt.timestamp() if dt else 0.0,
+                    }
+                )
+            if len(items) >= max_items:
+                break
+        return items
+
+    # Atom
+    for entry in root.findall("{*}entry"):
+        title = _strip_html((entry.findtext("{*}title") or "").strip())
+        link = ""
+        for link_node in entry.findall("{*}link"):
+            href = (link_node.attrib.get("href") or "").strip()
+            rel = (link_node.attrib.get("rel") or "alternate").strip()
+            if href and rel in {"alternate", ""}:
+                link = href
+                break
+        if not link:
+            first_link = entry.find("{*}link")
+            if first_link is not None:
+                link = (first_link.attrib.get("href") or "").strip()
+        raw_time = (entry.findtext("{*}published") or entry.findtext("{*}updated") or "").strip()
+        desc_raw = (entry.findtext("{*}summary") or entry.findtext("{*}content") or "").strip()
+        dt = _parse_news_time(raw_time)
+        summary = _truncate(_strip_html(desc_raw), 140)
+        if title and link:
+            items.append(
+                {
+                    "title": title,
+                    "link": urljoin(source_url, link),
+                    "source": source_name,
+                    "tier": tier,
+                    "source_weight": source_weight,
+                    "region": region,
+                    "published_at": _format_news_time(dt),
+                    "summary": summary,
+                    "timestamp": dt.timestamp() if dt else 0.0,
+                }
+            )
+        if len(items) >= max_items:
+            break
+    return items
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_ai_news(max_per_feed: int, nonce: int = 0) -> tuple[list[dict], list[str]]:
+    _ = nonce  # cache-buster by refresh button
+    all_items: list[dict] = []
+    errors: list[str] = []
+    for feed in AI_NEWS_FEEDS:
+        name = str(feed.get("name", "未知来源"))
+        try:
+            all_items.extend(_parse_feed_items(feed, max_per_feed))
+        except Exception as exc:
+            errors.append(f"{name} 抓取失败：{exc}")
+    events = _build_news_events(all_items)
+    return events, errors
 
 
 def ensure_state(data: dict) -> None:
@@ -527,12 +969,479 @@ def render_header(meta: dict) -> None:
             font-weight: 700;
         }
 
+        .news-shell {
+            border: 1px solid #d8e4ef;
+            border-radius: 16px;
+            background: #ffffff;
+            box-shadow: 0 10px 22px rgba(21, 48, 79, 0.08);
+            overflow: hidden;
+        }
+
+        .news-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 14px;
+            border-bottom: 1px solid #e3edf6;
+            background: linear-gradient(90deg, #fff4ea, #edf8ff);
+        }
+
+        .news-title-main {
+            font-size: 1.02rem;
+            font-weight: 800;
+            color: #1b2e42;
+        }
+
+        .news-meta {
+            font-size: 0.8rem;
+            color: #597086;
+        }
+
+        .breaking-wrap {
+            margin-bottom: 12px;
+            border: 1px solid #f1c9c9;
+            border-radius: 12px;
+            background: linear-gradient(90deg, #fff5f5, #fffaf8);
+            overflow: hidden;
+            position: relative;
+        }
+
+        .breaking-label {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 82px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.74rem;
+            font-weight: 800;
+            color: #9c1b1b;
+            background: linear-gradient(90deg, #ffd9d9, #fff2f2);
+            border-right: 1px solid #f0c7c7;
+        }
+
+        .breaking-ticker {
+            margin-left: 82px;
+            white-space: nowrap;
+            overflow: hidden;
+            padding: 10px 0;
+        }
+
+        .breaking-track {
+            display: inline-flex;
+            gap: 26px;
+            padding-right: 26px;
+            animation: breaking-scroll 30s linear infinite;
+            will-change: transform;
+        }
+
+        .breaking-ticker:hover .breaking-track {
+            animation-play-state: paused;
+        }
+
+        .breaking-item {
+            color: #532323 !important;
+            text-decoration: none !important;
+            font-size: 0.86rem;
+            font-weight: 700;
+        }
+
+        .breaking-item:hover {
+            text-decoration: underline !important;
+            color: #7a1818 !important;
+        }
+
+        .breaking-new {
+            display: inline-block;
+            margin-right: 6px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            background: #ff4c4c;
+            color: #fff;
+            font-size: 0.66rem;
+            font-weight: 800;
+            letter-spacing: 0.03em;
+        }
+
+        @keyframes breaking-scroll {
+            0% { transform: translateX(0); }
+            100% { transform: translateX(-50%); }
+        }
+
+        .hot-grid {
+            display: grid;
+            gap: 10px;
+            padding: 12px;
+            background: #f7fbff;
+        }
+
+        .hot-card {
+            display: grid;
+            gap: 8px;
+            border: 1px solid #deebf7;
+            border-radius: 12px;
+            background: #ffffff;
+            padding: 10px 11px;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+
+        .hot-card:hover {
+            transform: translateY(-1px);
+            border-color: #a7c9e8;
+            box-shadow: 0 8px 16px rgba(24, 56, 88, 0.12);
+        }
+
+        .hot-card-link {
+            text-decoration: none !important;
+            color: inherit !important;
+            display: block;
+        }
+
+        .hot-card-link:hover .hot-title {
+            color: #0f5f95;
+        }
+
+        .hot-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .hot-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .rank-badge {
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #ff9b62, #ff7a43);
+            color: #fff;
+            font-size: 0.78rem;
+            font-weight: 800;
+            display: grid;
+            place-items: center;
+            flex: 0 0 28px;
+            box-shadow: 0 5px 10px rgba(222, 110, 61, 0.28);
+        }
+
+        .hot-tier {
+            font-size: 0.74rem;
+            font-weight: 700;
+            color: #2f688d;
+            background: #eef7ff;
+            border: 1px solid #cfe3f4;
+            border-radius: 999px;
+            padding: 3px 8px;
+            width: fit-content;
+            white-space: nowrap;
+        }
+
+        .hot-score {
+            color: #7a4a19;
+            background: #fff3e8;
+            border: 1px solid #ffd4af;
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 0.74rem;
+            font-weight: 800;
+            white-space: nowrap;
+        }
+
+        .news-time {
+            color: #6e8296;
+            font-size: 0.78rem;
+            white-space: nowrap;
+        }
+
+        .news-link {
+            color: #1e3247 !important;
+            text-decoration: none !important;
+            font-size: 0.95rem;
+            font-weight: 700;
+            line-height: 1.4;
+        }
+
+        .news-link:hover {
+            color: #0f5f95 !important;
+            text-decoration: underline !important;
+        }
+
+        .news-summary {
+            color: #4b6177;
+            font-size: 0.86rem;
+            line-height: 1.48;
+        }
+
+        .news-source-line {
+            color: #5f7387;
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+
+        .hot-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .hot-tag {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            border: 1px solid #d4e3f3;
+            background: #f0f6ff;
+            color: #5f7083;
+        }
+
+        .hot-tag.just {
+            background: #ffecec;
+            border-color: #ffc9c9;
+            color: #a32a2a;
+        }
+
+        .countdown-wrap {
+            margin: 12px 0 14px;
+            border: 1px solid #dbe8f3;
+            border-radius: 14px;
+            background: #ffffff;
+            overflow: hidden;
+            box-shadow: 0 8px 18px rgba(24, 56, 88, 0.08);
+        }
+
+        .countdown-head {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e5eff8;
+            background: linear-gradient(90deg, #eef8ff, #fff4eb);
+            color: #243b52;
+            font-weight: 800;
+            font-size: 0.9rem;
+        }
+
+        .countdown-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px;
+            padding: 11px;
+            background: #f8fbff;
+        }
+
+        .countdown-card {
+            border: 1px solid #d9e7f3;
+            border-radius: 12px;
+            background: #ffffff;
+            padding: 10px;
+            display: grid;
+            gap: 7px;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+
+        .countdown-card:hover {
+            transform: translateY(-1px);
+            border-color: #9fc2e3;
+            box-shadow: 0 8px 16px rgba(24, 56, 88, 0.12);
+        }
+
+        .countdown-card.soon {
+            border-color: #ffc6c6;
+            background: linear-gradient(160deg, #fffefe, #fff7f7);
+        }
+
+        .countdown-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .countdown-tag {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            border: 1px solid #d3e3f3;
+            background: #eef7ff;
+            color: #53718e;
+        }
+
+        .countdown-left {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            border: 1px solid #ffd2b0;
+            background: #fff3e8;
+            color: #8b4e1c;
+            white-space: nowrap;
+        }
+
+        .countdown-title {
+            font-size: 0.94rem;
+            font-weight: 700;
+            color: #1d3349;
+            line-height: 1.38;
+        }
+
+        .countdown-link {
+            text-decoration: none !important;
+            color: inherit !important;
+            display: block;
+        }
+
+        .countdown-link:hover .countdown-title {
+            color: #0f5f95;
+        }
+
+        .countdown-meta {
+            font-size: 0.78rem;
+            color: #667f96;
+        }
+
+        .countdown-bar {
+            height: 8px;
+            border-radius: 999px;
+            background: #eaf2fa;
+            overflow: hidden;
+        }
+
+        .countdown-bar > span {
+            display: block;
+            height: 100%;
+            background: linear-gradient(90deg, #ff8c57, #2fa5bc);
+            border-radius: 999px;
+            min-width: 4px;
+        }
+
+        .countdown-foot {
+            font-size: 0.75rem;
+            color: #7a8ea1;
+        }
+
+        .timeline-wrap {
+            margin-top: 14px;
+            border: 1px solid #dbe7f2;
+            border-radius: 14px;
+            background: #ffffff;
+            overflow: hidden;
+        }
+
+        .timeline-head {
+            padding: 10px 12px;
+            border-bottom: 1px solid #e5eff8;
+            background: #f7fbff;
+            color: #2c445a;
+            font-weight: 800;
+            font-size: 0.9rem;
+        }
+
+        .timeline-list {
+            display: grid;
+            gap: 0;
+        }
+
+        .timeline-item {
+            padding: 10px 12px;
+            border-bottom: 1px solid #edf3f9;
+            display: grid;
+            gap: 6px;
+            transition: background-color 0.15s ease;
+        }
+
+        .timeline-item:last-child {
+            border-bottom: none;
+        }
+
+        .timeline-item:hover {
+            background: #fbfdff;
+        }
+
+        .hot-title {
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #1e3247;
+            line-height: 1.4;
+        }
+
+        .hot-meta-line {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .timeline-related {
+            font-size: 0.78rem;
+            color: #7b8fa3;
+            padding-left: 4px;
+        }
+
+        .rank-badge.rank-1 {
+            background: linear-gradient(135deg, #ffd700, #ffb300);
+            box-shadow: 0 5px 10px rgba(255, 179, 0, 0.35);
+        }
+
+        .rank-badge.rank-2 {
+            background: linear-gradient(135deg, #c0c0c0, #9e9e9e);
+            box-shadow: 0 5px 10px rgba(158, 158, 158, 0.3);
+        }
+
+        .rank-badge.rank-3 {
+            background: linear-gradient(135deg, #cd7f32, #b06a28);
+            box-shadow: 0 5px 10px rgba(176, 106, 40, 0.3);
+        }
+
+        .breaking-hot {
+            display: inline-block;
+            margin-right: 6px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ff4c4c, #ff6b3d);
+            color: #fff;
+            font-size: 0.66rem;
+            font-weight: 800;
+            letter-spacing: 0.03em;
+            animation: pulse-hot 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-hot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.65; }
+        }
+
         @media (max-width: 768px) {
             .card-desc {
                 min-height: auto;
             }
             .hero-shell {
                 padding: 16px 14px;
+            }
+            .breaking-label {
+                position: static;
+                width: 100%;
+                border-right: none;
+                border-bottom: 1px solid #f0c7c7;
+                padding: 6px 0;
+            }
+            .breaking-ticker {
+                margin-left: 0;
+                padding: 8px 0;
+            }
+            .news-time {
+                text-align: left;
             }
         }
         </style>
@@ -788,6 +1697,233 @@ def render_tools(data: dict, tab: str) -> None:
             )
 
 
+def render_ai_news_tab(data: dict | None = None) -> None:
+    st.subheader(AI_NEWS_TAB)
+    st.caption("实时滚动头条 + 热度趋势榜 + 长尾时间流，聚合多源 AI 资讯并自动去重。")
+
+    with st.sidebar:
+        st.markdown("### 快报设置")
+        max_per_feed = st.slider("每个来源抓取条数", min_value=5, max_value=30, value=12, key="news_per_feed")
+        max_total = st.slider("页面最多展示事件", min_value=20, max_value=140, value=70, key="news_max_total")
+        hot_count = st.slider("热榜展示条数", min_value=6, max_value=25, value=12, key="news_hot_count")
+        if st.button("刷新快报", key="news_refresh"):
+            st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
+    nonce = int(st.session_state.get("news_nonce", 0))
+
+    keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
+    events, errors = fetch_ai_news(max_per_feed=max_per_feed, nonce=nonce)
+    _ = errors  # diagnostics only, keep UI clean
+
+    source_options = sorted({str(src) for ev in events for src in ev.get("sources", []) if str(src).strip()})
+    selected_sources = st.multiselect(
+        "来源筛选",
+        source_options,
+        default=source_options,
+        key="news_sources_filter",
+        placeholder="默认全选",
+    )
+    region_options = sorted({str(r) for ev in events for r in ev.get("regions", []) if str(r).strip()})
+    selected_regions = st.multiselect(
+        "区域筛选",
+        region_options,
+        default=region_options,
+        key="news_regions_filter",
+        placeholder="默认全选",
+    )
+    time_window = st.selectbox("时间范围", ["全部", "24小时", "3天", "7天", "30天"], key="news_time_window")
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    window_map = {"24小时": 24 * 3600, "3天": 3 * 24 * 3600, "7天": 7 * 24 * 3600, "30天": 30 * 24 * 3600}
+    keep_seconds = window_map.get(time_window)
+    key = keyword.strip().lower()
+
+    filtered: list[dict] = []
+    for ev in events:
+        ts = float(ev.get("timestamp", 0) or 0)
+        if keep_seconds and ts and now_ts - ts > keep_seconds:
+            continue
+        if source_options and selected_sources:
+            if not any(src in selected_sources for src in ev.get("sources", [])):
+                continue
+        if region_options and selected_regions:
+            if not any(region in selected_regions for region in ev.get("regions", [])):
+                continue
+        if key:
+            blob = " ".join(
+                [
+                    str(ev.get("title", "")),
+                    str(ev.get("summary", "")),
+                    str(ev.get("source", "")),
+                    " ".join(str(x) for x in ev.get("sources", [])),
+                    " ".join(str(x) for x in ev.get("regions", [])),
+                ]
+            ).lower()
+            if key not in blob:
+                continue
+        filtered.append(ev)
+
+    if not filtered:
+        st.warning("当前没有可展示的快报，请放宽筛选条件或点击“刷新快报”。")
+        return
+
+    filtered = sorted(filtered, key=lambda x: (float(x.get("heat_score", 0)), float(x.get("timestamp", 0))), reverse=True)
+    timeline_events = sorted(filtered, key=lambda x: float(x.get("timestamp", 0)), reverse=True)[:max_total]
+    hot_events = filtered[: min(hot_count, len(filtered))]
+    hot_ids = {str(x.get("id", "")) for x in hot_events}
+    tail_events = [x for x in timeline_events if str(x.get("id", "")) not in hot_ids]
+    if len(tail_events) < 8:
+        tail_events = timeline_events
+
+    breaking_events = [x for x in timeline_events if bool(x.get("is_breaking")) and now_ts - float(x.get("timestamp", 0)) <= 2 * 3600]
+    if not breaking_events:
+        sa_recent = [x for x in timeline_events if _tier_rank(str(x.get("tier", "B"))) >= _tier_rank("A")]
+        breaking_events = (sa_recent or timeline_events)[: min(8, len(sa_recent or timeline_events))]
+    breaking_events = breaking_events[:8]
+
+    source_count = len({src for ev in filtered for src in ev.get("sources", [])})
+    st.caption(f"覆盖来源：{source_count} / {len(AI_NEWS_FEEDS)} · 聚合事件：{len(filtered)}")
+
+    if breaking_events:
+        ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
+        ticker_html = "".join(
+            (
+                f"<a class='breaking-item' href='{escape(str(ev.get('link', '')), quote=True)}' target='_blank' rel='noopener noreferrer'>"
+                + (
+                    "<span class='breaking-hot'>沸点</span>"
+                    if int(ev.get("heat_score", 0)) >= 1000
+                    else "<span class='breaking-new'>NEW</span>"
+                )
+                + f"{escape(str(ev.get('title', '无标题')))}"
+                f" · {escape(str(ev.get('source', '未知来源')))}"
+                "</a>"
+            )
+            for ev in ticker_seed
+        )
+        st.markdown(
+            (
+                "<section class='breaking-wrap'>"
+                "<div class='breaking-label'>实时头条</div>"
+                "<div class='breaking-ticker'>"
+                f"<div class='breaking-track'>{ticker_html}</div>"
+                "</div>"
+                "</section>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+    upcoming_events = _build_upcoming_events(data)
+    if upcoming_events:
+        def _countdown_card(ev: dict) -> str:
+            soon_cls = " soon" if ev.get("is_soon") else ""
+            body = (
+                f"<article class='countdown-card{soon_cls}'>"
+                "<div class='countdown-top'>"
+                f"<span class='countdown-tag'>{escape(str(ev.get('tag', '发布预告')))}</span>"
+                f"<span class='countdown-left'>还剩 {escape(str(ev.get('remaining_text', '已开始')))}</span>"
+                "</div>"
+                f"<div class='countdown-title'>{escape(str(ev.get('title', '预告事件')))}</div>"
+                f"<div class='countdown-meta'>目标时间：{escape(str(ev.get('target_text', '时间未知')))}</div>"
+                f"<div class='countdown-bar'><span style='width:{int(ev.get('progress_pct', 0))}%;'></span></div>"
+                f"<div class='countdown-foot'>约 {int(ev.get('remaining_minutes', 0))} 分钟</div>"
+                "</article>"
+            )
+            url = str(ev.get("url", "")).strip()
+            if not url:
+                return body
+            return (
+                f"<a class='countdown-link' href='{escape(url, quote=True)}' target='_blank' rel='noopener noreferrer'>"
+                f"{body}"
+                "</a>"
+            )
+
+        countdown_rows = "".join(_countdown_card(ev) for ev in upcoming_events)
+        st.markdown(
+            (
+                "<section class='countdown-wrap'>"
+                "<div class='countdown-head'>发布会/预告倒计时</div>"
+                f"<div class='countdown-grid'>{countdown_rows}</div>"
+                "</section>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+    def _hot_card(idx: int, ev: dict) -> str:
+        rank_cls = f" rank-{idx}" if idx <= 3 else ""
+        just_tag = "<span class='hot-tag just'>刚</span>" if ev.get("is_just") else ""
+        cross_tag = "<span class='hot-tag'>跨源讨论</span>" if int(ev.get("source_mentions", 1)) > 1 else ""
+        related = int(ev.get("related_count", 0))
+        related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
+        link = escape(str(ev.get("link", "")), quote=True)
+        return (
+            f"<a class='card-link hot-card-link' href='{link}' target='_blank' rel='noopener noreferrer'>"
+            f"<article class='hot-card'>"
+            f"<div class='hot-top'>"
+            f"<div class='hot-left'>"
+            f"<span class='rank-badge{rank_cls}'>{idx}</span>"
+            f"<span class='hot-tier'>{escape(str(ev.get('tier', 'B')))}级来源</span>"
+            f"</div>"
+            f"<span class='hot-score'>{escape(str(ev.get('hot_emoji', '')))} 热度 {int(ev.get('heat_score', 0))}</span>"
+            f"</div>"
+            f"<div class='hot-title'>{escape(str(ev.get('title', '无标题')))}</div>"
+            f"<div class='news-summary'>{escape(str(ev.get('summary', '核心看点：点击查看详情。')))}</div>"
+            f"<div class='hot-tags'>"
+            f"<span class='hot-tag'>{escape(str(ev.get('emotion_tag', '💡 观察')))}</span>"
+            f"{just_tag}{cross_tag}"
+            f"</div>"
+            f"<div class='news-source-line'>参考来源：{escape(str(ev.get('source_line', '未知来源')))}</div>"
+            f"{related_html}"
+            f"<div class='hot-meta-line'>"
+            f"<span class='news-time'>{escape(str(ev.get('relative_time', '时间未知')))}</span>"
+            f"<span class='news-time'>{escape(str(ev.get('published_at', '时间未知')))}</span>"
+            f"</div>"
+            f"</article>"
+            f"</a>"
+        )
+
+    hot_rows = "".join(_hot_card(idx, ev) for idx, ev in enumerate(hot_events, start=1))
+    st.markdown(
+        (
+            "<section class='news-shell'>"
+            "<div class='news-head'>"
+            "<div class='news-title-main'>AI 热度趋势榜</div>"
+            "<div class='news-meta'>按来源权重 + 多源提及 + 时间衰减计算</div>"
+            "</div>"
+            f"<div class='hot-grid'>{hot_rows}</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    def _timeline_item(ev: dict) -> str:
+        related = int(ev.get("related_count", 0))
+        related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
+        link = escape(str(ev.get("link", "")), quote=True)
+        return (
+            f"<article class='timeline-item'>"
+            f"<div class='hot-meta-line'>"
+            f"<span class='hot-tier'>{escape(str(ev.get('source', '未知来源')))}</span>"
+            f"<span class='news-time'>{escape(str(ev.get('relative_time', '时间未知')))}</span>"
+            f"</div>"
+            f"<a class='news-link' href='{link}' target='_blank' rel='noopener noreferrer'>"
+            f"{escape(str(ev.get('title', '无标题')))}</a>"
+            f"<div class='news-summary'>{escape(str(ev.get('summary', '核心看点：点击查看详情。')))}</div>"
+            f"<div class='news-source-line'>参考来源：{escape(str(ev.get('source_line', '未知来源')))}</div>"
+            f"{related_html}"
+            f"</article>"
+        )
+
+    timeline_rows = "".join(_timeline_item(ev) for ev in tail_events)
+    st.markdown(
+        (
+            "<section class='timeline-wrap'>"
+            "<div class='timeline-head'>普通时间流</div>"
+            f"<div class='timeline-list'>{timeline_rows}</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def render_test_toolset_tab() -> None:
     st.subheader("测试工程师常用工具集")
     st.caption("点击卡片即可跳转到工具集站点。")
@@ -842,6 +1978,8 @@ def main() -> None:
 
     if active_tab == "公告":
         render_announcement(data)
+    elif active_tab == AI_NEWS_TAB:
+        render_ai_news_tab(data)
     elif active_tab == TEST_TOOLSET_TAB:
         render_test_toolset_tab()
     else:

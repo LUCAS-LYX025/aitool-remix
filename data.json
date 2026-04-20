@@ -11,8 +11,32 @@
     "OpenClaw",
     "软件测试工具",
     "软件测试学习网站",
+    "🚀 前线快爆",
     "测试工程师常用工具集",
     "公告"
+  ],
+  "aiUpcomingEvents": [
+    {
+      "title": "Google I/O 2026 开幕（官方）",
+      "target_at": "2026-05-19T10:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://blog.google/innovation-and-ai/technology/developers-tools/io-2026-save-the-date/",
+      "window_hours": 960
+    },
+    {
+      "title": "Microsoft Build 2026 开幕（官方）",
+      "target_at": "2026-06-02T09:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://build.microsoft.com/en-US/home",
+      "window_hours": 1080
+    },
+    {
+      "title": "Apple WWDC26 开幕（官方）",
+      "target_at": "2026-06-08T10:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://www.apple.com/newsroom/2026/03/apples-worldwide-developers-conference-returns-the-week-of-june-8/",
+      "window_hours": 1200
+    }
   ],
   "aiTools": [
     {
