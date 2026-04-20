@@ -1,9 +1,10 @@
 {
   "siteMeta": {
     "title": "Lucas 常用网站与工具导航",
-    "subtitle": "收录与珍藏好用的AI工具与日常网站。"
+    "subtitle": "收录前线 AI 快报与珍藏好用的 AI 工具、学习网站。"
   },
   "tabs": [
+    "🚀 前线快报",
     "AI工具",
     "Prompt",
     "Skill",
@@ -13,6 +14,99 @@
     "软件测试学习网站",
     "测试工程师常用工具集",
     "公告"
+  ],
+  "aiUpcomingEvents": [
+    {
+      "title": "Google I/O 2026 开幕（官方）",
+      "target_at": "2026-05-19T10:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://blog.google/innovation-and-ai/technology/developers-tools/io-2026-save-the-date/",
+      "window_hours": 960
+    },
+    {
+      "title": "Microsoft Build 2026 开幕（官方）",
+      "target_at": "2026-06-02T09:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://build.microsoft.com/en-US/home",
+      "window_hours": 1080
+    },
+    {
+      "title": "Apple WWDC26 开幕（官方）",
+      "target_at": "2026-06-08T10:00:00-07:00",
+      "tag": "S级·官宣",
+      "url": "https://www.apple.com/newsroom/2026/03/apples-worldwide-developers-conference-returns-the-week-of-june-8/",
+      "window_hours": 1200
+    },
+    {
+      "title": "WAICA 2026 论文提交截止（官方）",
+      "target_at": "2026-04-30T23:59:00+08:00",
+      "tag": "A级·国内学术",
+      "url": "https://waica2026.worldaic.com.cn/",
+      "window_hours": 720
+    },
+    {
+      "title": "WAICA 2026 录用通知发布（官方）",
+      "target_at": "2026-06-21T10:00:00+08:00",
+      "tag": "A级·国内学术",
+      "url": "https://waica2026.worldaic.com.cn/",
+      "window_hours": 960
+    },
+    {
+      "title": "WAICA 2026 终稿提交截止（官方）",
+      "target_at": "2026-06-30T23:59:00+08:00",
+      "tag": "A级·国内学术",
+      "url": "https://waica2026.worldaic.com.cn/",
+      "window_hours": 960
+    },
+    {
+      "title": "ICLR 2026 主会开幕（官方）",
+      "target_at": "2026-04-23T09:00:00-03:00",
+      "tag": "S级·国际顶会",
+      "url": "https://iclr.cc/",
+      "window_hours": 720
+    },
+    {
+      "title": "NeurIPS 2026 Abstract 截止（AoE）",
+      "target_at": "2026-05-05T19:59:00+08:00",
+      "tag": "S级·国际顶会",
+      "url": "https://neurips.cc/",
+      "window_hours": 840
+    },
+    {
+      "title": "NeurIPS 2026 Full Paper 截止（AoE）",
+      "target_at": "2026-05-07T19:59:00+08:00",
+      "tag": "S级·国际顶会",
+      "url": "https://neurips.cc/",
+      "window_hours": 900
+    },
+    {
+      "title": "CVPR 2026 主会开幕（官方）",
+      "target_at": "2026-06-03T09:00:00-06:00",
+      "tag": "S级·国际顶会",
+      "url": "https://cvpr.thecvf.com/",
+      "window_hours": 1020
+    },
+    {
+      "title": "CVPR 2026 主会开始（官方）",
+      "target_at": "2026-06-05T09:00:00-06:00",
+      "tag": "S级·国际顶会",
+      "url": "https://cvpr.thecvf.com/",
+      "window_hours": 1080
+    },
+    {
+      "title": "ICML 2026 主会开幕（官方）",
+      "target_at": "2026-07-06T09:00:00+09:00",
+      "tag": "S级·国际顶会",
+      "url": "https://icml.cc/",
+      "window_hours": 1260
+    },
+    {
+      "title": "NeurIPS 2026 大会开幕（官方）",
+      "target_at": "2026-12-06T09:00:00-05:00",
+      "tag": "S级·国际顶会",
+      "url": "https://neurips.cc/",
+      "window_hours": 1800
+    }
   ],
   "aiTools": [
     {
@@ -3507,7 +3601,7 @@
         "title": "本站能帮你更快进入实战",
         "intro": "这是一个为测试工程师与 AI 实践者打造的工具导航站：把高频网站、实战工具与学习资源集中整理，让你在一个页面里完成“发现工具 → 进入使用 → 持续学习”的完整闭环。",
         "bullets": [
-          "内容覆盖完整：AI 工具、Prompt、Skill、MCP、OpenClaw、测试工具与学习网站七大栏目。",
+          "内容覆盖完整：前线快报、AI 工具、Prompt、Skill、MCP、OpenClaw、测试工具、学习网站、测试工具集九大栏目。",
           "按工作流组织：从需求分析、测试设计、自动化落地到性能/安全进阶，按场景快速定位。",
           "卡片即入口：每个站点都带用途说明和标签，减少“看名字猜用途”的时间成本。",
           "精选优先：优先保留官方文档、权威社区和高质量实践站点，降低信息噪音。",

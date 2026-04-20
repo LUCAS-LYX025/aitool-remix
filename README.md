@@ -1,6 +1,6 @@
 # Lucas 常用网站与工具导航
 
-基于 **Streamlit** 的多栏目导航站，聚合 AI 工具、Prompt、Skill、MCP、OpenClaw、软件测试工具与学习网站，并支持站点图标、公告卡片、分类筛选与关键词搜索。
+基于 **Streamlit** 的多栏目导航站，聚合前线 AI 快报、AI 工具、Prompt、Skill、MCP、OpenClaw、软件测试工具与学习网站，并支持站点图标、公告卡片、分类筛选与关键词搜索。
 
 当前在线工具集（独立 tab 跳转）：
 - https://lucas-testtool-online.streamlit.app/
@@ -8,6 +8,7 @@
 ## 功能概览
 
 - 多 Tab 导航：
+  - `🚀 前线快报`
   - `AI工具`
   - `Prompt`
   - `Skill`
@@ -19,6 +20,9 @@
   - `公告`
 - 卡片化展示（标题 / 描述 / 标签 / 分类）
 - 侧边栏分类筛选 + 全局关键词搜索
+- `🚀 前线快报`：实时滚动头条 + 热度趋势榜 + 普通时间流
+- 支持 `aiUpcomingEvents` 倒计时卡片（可配置发布会/截稿节点）
+- `🚀 前线快报` 页面默认每 30 分钟自动刷新并触发新一轮拉取
 - 公告区支持富样式信息卡与 CTA 按钮
 - 图标优先本地命中，缺失时自动走 favicon 兜底
 
@@ -75,6 +79,14 @@ aitool-remix/
 
 系统会优先用本地图标；未命中时再尝试远程 favicon 兜底。
 
+### 3) 配置前线快报倒计时
+
+在 `data.json` 的 `aiUpcomingEvents` 数组维护事件：
+
+- 必填字段：`title`, `target_at`
+- 推荐字段：`tag`, `url`, `window_hours`
+- `target_at` 建议使用 ISO 时间（例如 `2026-06-08T10:00:00-07:00`）
+
 ## 图标策略（应用内）
 
 卡片图标加载顺序：
@@ -93,4 +105,3 @@ aitool-remix/
 5. 部署
 
 如果后续只改 `data.json` / `icons`，重新推送后会自动触发更新。
-
