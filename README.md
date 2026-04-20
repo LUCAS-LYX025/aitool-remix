@@ -30,7 +30,7 @@
 ## 本地运行
 
 ```bash
-cd /Users/leiyuxing/aitool-remix
+cd /Users/aitool-remix
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -93,15 +93,4 @@ aitool-remix/
 5. 部署
 
 如果后续只改 `data.json` / `icons`，重新推送后会自动触发更新。
-
-## 常见问题
-
-- 图标不显示：
-  - 先检查 `icons/name_overrides.json` 是否有映射
-  - 再检查 `icons/` 文件名（stem）是否与映射一致
-  - 最后确认目标站点 favicon 是否可访问
-
-- 新增后看不到变更：
-  - 检查 `data.json` 是否是合法 JSON
-  - Streamlit 页面强制刷新（`Ctrl/Cmd + Shift + R`）
 
