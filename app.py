@@ -1131,6 +1131,114 @@ def render_header(meta: dict) -> None:
             font-weight: 700;
         }
 
+        .skillhot-shell {
+            border: 1px solid #d8e6f2;
+            border-radius: 16px;
+            background: linear-gradient(155deg, #ffffff, #f5fbff);
+            box-shadow: 0 10px 22px rgba(21, 48, 79, 0.08);
+            padding: 12px;
+            margin-bottom: 12px;
+        }
+
+        .skillhot-head {
+            font-size: 1.02rem;
+            font-weight: 800;
+            color: #1b2e42;
+            margin-bottom: 8px;
+        }
+
+        .skillhot-group {
+            margin-bottom: 12px;
+        }
+
+        .skillhot-group:last-child {
+            margin-bottom: 0;
+        }
+
+        .skillhot-group-title {
+            font-size: 0.86rem;
+            color: #45607a;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+
+        .skillhot-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .skillhot-card {
+            border: 1px solid #d9e7f3;
+            border-radius: 12px;
+            background: #ffffff;
+            padding: 10px;
+            display: grid;
+            gap: 7px;
+        }
+
+        .skillhot-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .skillhot-name {
+            font-size: 0.92rem;
+            font-weight: 800;
+            color: #1f3449;
+            line-height: 1.3;
+        }
+
+        .skillhot-star {
+            font-size: 0.73rem;
+            font-weight: 800;
+            color: #8b4e1c;
+            background: #fff3e8;
+            border: 1px solid #ffd2ae;
+            border-radius: 999px;
+            padding: 2px 8px;
+            white-space: nowrap;
+        }
+
+        .skillhot-desc {
+            color: #4a6178;
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }
+
+        .skillhot-row {
+            font-size: 0.78rem;
+            color: #5f7488;
+            line-height: 1.4;
+        }
+
+        .skillhot-row a {
+            color: #0f5f95 !important;
+            text-decoration: none !important;
+            font-weight: 700;
+        }
+
+        .skillhot-row a:hover {
+            text-decoration: underline !important;
+        }
+
+        .skillhot-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .skillhot-tag {
+            font-size: 0.72rem;
+            color: #597087;
+            background: #f1f7ff;
+            border: 1px solid #d2e2f2;
+            border-radius: 999px;
+            padding: 2px 8px;
+        }
+
         .news-shell {
             border: 1px solid #d8e4ef;
             border-radius: 16px;
@@ -1588,6 +1696,9 @@ def render_header(meta: dict) -> None:
             .card-desc {
                 min-height: auto;
             }
+            .skillhot-grid {
+                grid-template-columns: 1fr;
+            }
             .hero-shell {
                 padding: 16px 14px;
             }
@@ -1780,6 +1891,61 @@ def render_announcement(data: dict) -> None:
             {cta_html}
         </section>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_skill_hotspots(data: dict) -> None:
+    groups = data.get("skillHotspots", [])
+    if not groups:
+        return
+
+    group_html: list[str] = []
+    for group in groups:
+        category = escape(str(group.get("category", "热点分类")))
+        updated_at = escape(str(group.get("updatedAt", "")))
+        items = group.get("items", []) or []
+        cards: list[str] = []
+        for item in items:
+            name = escape(str(item.get("name", "未命名 Skill")))
+            star = escape(str(item.get("star", "N/A")))
+            desc = escape(str(item.get("summary", "暂无说明")))
+            download_url = str(item.get("downloadUrl", "")).strip()
+            download_cmd = escape(str(item.get("downloadCmd", "")).strip())
+            download_html = (
+                f"<a href='{escape(download_url, quote=True)}' target='_blank' rel='noopener noreferrer'>下载地址</a>"
+                if download_url
+                else "下载地址待补充"
+            )
+            scenarios = item.get("scenarios", []) or []
+            scenario_html = "".join(f"<span class='skillhot-tag'>{escape(str(x))}</span>" for x in scenarios[:5])
+            cmd_html = f"<div class='skillhot-row'>命令：<code>{download_cmd}</code></div>" if download_cmd else ""
+            cards.append(
+                "<article class='skillhot-card'>"
+                "<div class='skillhot-top'>"
+                f"<div class='skillhot-name'>{name}</div>"
+                f"<span class='skillhot-star'>⭐ {star}</span>"
+                "</div>"
+                f"<div class='skillhot-desc'>{desc}</div>"
+                f"<div class='skillhot-row'>下载：{download_html}</div>"
+                f"{cmd_html}"
+                f"<div class='skillhot-tags'>{scenario_html}</div>"
+                "</article>"
+            )
+        group_html.append(
+            "<section class='skillhot-group'>"
+            f"<div class='skillhot-group-title'>{category}{f' · 更新于 {updated_at}' if updated_at else ''}</div>"
+            f"<div class='skillhot-grid'>{''.join(cards)}</div>"
+            "</section>"
+        )
+
+    st.markdown(
+        (
+            "<section class='skillhot-shell'>"
+            "<div class='skillhot-head'>热点 Skill 分类汇总（按 Star 初筛）</div>"
+            f"{''.join(group_html)}"
+            "</section>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -2165,6 +2331,9 @@ def main() -> None:
         render_ai_news_tab(data)
     elif active_tab == TEST_TOOLSET_TAB:
         render_test_toolset_tab()
+    elif active_tab == "Skill":
+        render_skill_hotspots(data)
+        render_tools(data, active_tab)
     else:
         render_tools(data, active_tab)
 

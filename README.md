@@ -87,6 +87,14 @@ aitool-remix/
 - 推荐字段：`tag`, `url`, `window_hours`
 - `target_at` 建议使用 ISO 时间（例如 `2026-06-08T10:00:00-07:00`）
 
+### 4) 配置 Skill 热点汇总
+
+在 `data.json` 的 `skillHotspots` 维护热点分组（按 Star 初筛）：
+
+- 分组字段：`category`, `updatedAt`, `items`
+- 条目字段：`name`, `star`, `summary`, `downloadUrl`, `downloadCmd`, `scenarios`
+- `Skill` Tab 会自动渲染“热点 Skill 分类汇总”卡片
+
 ## 图标策略（应用内）
 
 卡片图标加载顺序：
