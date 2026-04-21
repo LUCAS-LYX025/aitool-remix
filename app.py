@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import escape, unescape
@@ -12,6 +13,7 @@ from urllib.parse import quote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data.json"
@@ -19,7 +21,7 @@ ICON_DIR = BASE_DIR / "icons"
 ICON_NAME_MAP_PATH = ICON_DIR / "name_overrides.json"
 TEST_TOOLSET_TAB = "测试工程师常用工具集"
 TEST_TOOLSET_URL = "https://lucas-testtool-online.streamlit.app/"
-AI_NEWS_TAB = "🚀 前线快爆"
+AI_NEWS_TAB = "🚀 前线快报"
 AI_NEWS_FEEDS = [
     {
         "name": "Google 新闻（中文）",
@@ -48,6 +50,13 @@ AI_NEWS_FEEDS = [
 ]
 AI_UPCOMING_EVENTS: list[dict[str, str]] = []
 TIER_WEIGHT = {"S": 700, "A": 500, "B": 280}
+NEWS_FETCH_TIMEOUT = 4.2
+NEWS_FETCH_MAX_WORKERS = 8
+NEWS_SNAPSHOT_TTL_SECONDS = 900
+NEWS_SNAPSHOT_PATH = BASE_DIR / ".cache" / "ai_news_snapshot.json"
+NEWS_AUTO_REFRESH_MINUTES = 30
+NEWS_AUTO_REFRESH_INTERVAL_SECONDS = NEWS_AUTO_REFRESH_MINUTES * 60
+NEWS_AUTO_REFRESH_INTERVAL_MS = NEWS_AUTO_REFRESH_INTERVAL_SECONDS * 1000
 
 
 @st.cache_data(show_spinner=False)
@@ -556,14 +565,14 @@ def _fetch_text(url: str, timeout: float = 6.0) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def _parse_feed_items(feed: dict, max_items: int) -> list[dict]:
+def _parse_feed_items(feed: dict, max_items: int, timeout: float = NEWS_FETCH_TIMEOUT) -> list[dict]:
     source_name = str(feed.get("name", "未知来源"))
     source_url = str(feed.get("url", ""))
     tier = str(feed.get("tier", "B")).upper()
     source_weight = int(feed.get("weight", TIER_WEIGHT.get(tier, 280)))
     region = str(feed.get("region", "INTL")).upper()
 
-    xml_text = _fetch_text(source_url, timeout=7.0)
+    xml_text = _fetch_text(source_url, timeout=timeout)
     root = ET.fromstring(xml_text)
     items: list[dict] = []
 
@@ -646,18 +655,129 @@ def _parse_feed_items(feed: dict, max_items: int) -> list[dict]:
     return items
 
 
+def _active_news_feeds(include_community: bool) -> list[dict]:
+    if include_community:
+        return AI_NEWS_FEEDS
+    return [x for x in AI_NEWS_FEEDS if str(x.get("tier", "B")).upper() != "B"]
+
+
+def _snapshot_bucket(include_community: bool) -> str:
+    return "full" if include_community else "quick"
+
+
+def _read_news_snapshot(include_community: bool, max_age_seconds: int = NEWS_SNAPSHOT_TTL_SECONDS) -> list[dict] | None:
+    try:
+        if not NEWS_SNAPSHOT_PATH.exists():
+            return None
+        raw = json.loads(NEWS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        bucket = _snapshot_bucket(include_community)
+        payload = raw.get(bucket, {})
+        if not isinstance(payload, dict):
+            return None
+        updated_ts = int(payload.get("updated_ts", 0) or 0)
+        events = payload.get("events", [])
+        if not isinstance(events, list):
+            return None
+        if max_age_seconds > 0:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if updated_ts <= 0 or now_ts - updated_ts > max_age_seconds:
+                return None
+        return [x for x in events if isinstance(x, dict)]
+    except Exception:
+        return None
+
+
+def _write_news_snapshot(include_community: bool, events: list[dict]) -> None:
+    try:
+        NEWS_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        root: dict = {}
+        if NEWS_SNAPSHOT_PATH.exists():
+            try:
+                old = json.loads(NEWS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+                if isinstance(old, dict):
+                    root = old
+            except Exception:
+                root = {}
+        bucket = _snapshot_bucket(include_community)
+        root[bucket] = {
+            "updated_ts": int(datetime.now(timezone.utc).timestamp()),
+            "events": events,
+        }
+        tmp_path = NEWS_SNAPSHOT_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(root, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(NEWS_SNAPSHOT_PATH)
+    except Exception:
+        return
+
+
+def _install_news_auto_refresh(interval_ms: int = NEWS_AUTO_REFRESH_INTERVAL_MS) -> None:
+    # Client-side timed page refresh while this tab is open.
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const key = "__lucas_news_autorefresh_timer__";
+            if (window[key]) return;
+            window[key] = window.setTimeout(function() {{
+                try {{
+                    window.parent.location.reload();
+                }} catch (e) {{
+                    window.location.reload();
+                }}
+            }}, {int(interval_ms)});
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _bump_news_nonce_if_new_window(window_seconds: int = NEWS_AUTO_REFRESH_INTERVAL_SECONDS) -> None:
+    # Force one pull when entering a new 30-minute window.
+    bucket = int(datetime.now(timezone.utc).timestamp() // max(1, int(window_seconds)))
+    prev_bucket = st.session_state.get("news_auto_pull_bucket")
+    st.session_state["news_auto_pull_bucket"] = bucket
+    if prev_bucket is not None and int(prev_bucket) != bucket:
+        st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
+
+
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_ai_news(max_per_feed: int, nonce: int = 0) -> tuple[list[dict], list[str]]:
+def fetch_ai_news(max_per_feed: int, include_community: bool = False, nonce: int = 0) -> tuple[list[dict], list[str]]:
     _ = nonce  # cache-buster by refresh button
     all_items: list[dict] = []
     errors: list[str] = []
-    for feed in AI_NEWS_FEEDS:
-        name = str(feed.get("name", "未知来源"))
-        try:
-            all_items.extend(_parse_feed_items(feed, max_per_feed))
-        except Exception as exc:
-            errors.append(f"{name} 抓取失败：{exc}")
+
+    # Fast path: reuse fresh local snapshot when user did not force refresh.
+    if nonce == 0:
+        snapshot_events = _read_news_snapshot(include_community=include_community, max_age_seconds=NEWS_SNAPSHOT_TTL_SECONDS)
+        if snapshot_events:
+            return snapshot_events, []
+
+    feeds = _active_news_feeds(include_community=include_community)
+    if not feeds:
+        return [], []
+
+    max_workers = min(NEWS_FETCH_MAX_WORKERS, max(1, len(feeds)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_parse_feed_items, feed, max_per_feed): feed for feed in feeds}
+        for future in as_completed(future_map):
+            feed = future_map[future]
+            name = str(feed.get("name", "未知来源"))
+            try:
+                all_items.extend(future.result())
+            except Exception as exc:
+                errors.append(f"{name} 抓取失败：{exc}")
     events = _build_news_events(all_items)
+    if events:
+        _write_news_snapshot(include_community=include_community, events=events)
+        return events, errors
+
+    # Fallback: if all sources fail, return latest snapshot (even stale).
+    fallback_events = _read_news_snapshot(include_community=include_community, max_age_seconds=30 * 24 * 3600)
+    if fallback_events:
+        return fallback_events, errors
     return events, errors
 
 
@@ -789,6 +909,48 @@ def render_header(meta: dict) -> None:
         .stRadio [role="radiogroup"] label:hover {
             border-color: #7db2df;
             box-shadow: 0 4px 14px rgba(28, 111, 173, 0.12);
+        }
+
+        .subtag-wrap {
+            border: 1px solid #d6e5f2;
+            border-radius: 13px;
+            background: linear-gradient(165deg, #ffffff, #f5faff);
+            padding: 10px 12px 8px;
+            margin-bottom: 10px;
+        }
+
+        .subtag-kicker {
+            font-size: 0.74rem;
+            color: #55748f;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .subtag-path {
+            font-size: 0.8rem;
+            color: #6a839a;
+            margin-top: 4px;
+        }
+
+        [data-testid="stPills"] [role="radiogroup"] {
+            gap: 6px;
+            row-gap: 7px;
+        }
+
+        [data-testid="stPills"] [role="radiogroup"] label {
+            border: 1px solid #cfe1f0;
+            border-radius: 999px;
+            padding: 5px 11px;
+            background: #f3f9ff;
+            color: #36536b;
+            font-size: 0.8rem;
+            font-weight: 700;
+            transition: 0.16s ease;
+        }
+
+        [data-testid="stPills"] [role="radiogroup"] label:hover {
+            border-color: #88b4d9;
+            background: #eaf5ff;
         }
 
         .card-link {
@@ -1629,21 +1791,46 @@ def render_tools(data: dict, tab: str) -> None:
     if categories and default_category not in ["全部", *categories]:
         default_category = "全部"
 
-    with st.sidebar:
-        if categories:
-            options = ["全部", *categories]
-            category_key = f"category_{tab}"
-            if category_key not in st.session_state or st.session_state[category_key] not in options:
-                st.session_state[category_key] = default_category if default_category in options else "全部"
-            selected = st.radio("分类", options, key=category_key)
-            st.session_state["category_by_tab"][tab] = selected
-        else:
-            selected = None
+    selected: str | None = None
+    if categories:
+        options = ["全部", *categories]
+        category_key = f"category_{tab}"
+        if category_key not in st.session_state or st.session_state[category_key] not in options:
+            st.session_state[category_key] = default_category if default_category in options else "全部"
+        st.markdown(
+            f"""
+            <section class="subtag-wrap">
+                <div class="subtag-kicker">子标签筛选 · {escape(tab)}</div>
+            </section>
+            """,
+            unsafe_allow_html=True,
+        )
+        selected = st.pills(
+            f"{tab} 子标签",
+            options,
+            selection_mode="single",
+            default=st.session_state[category_key],
+            key=category_key,
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        if selected is None:
+            selected = "全部"
+        st.session_state["category_by_tab"][tab] = selected
+        st.markdown(
+            f"""
+            <section class="subtag-wrap" style="margin-top:-4px">
+                <div class="subtag-path">当前路径：{escape(tab)} / {escape(selected)}</div>
+            </section>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    search = st.text_input("搜索", key="search", placeholder="输入名称、描述、标签")
+    search = st.text_input("搜索", key="search", placeholder=f"在「{tab}」下搜索名称、描述、标签")
 
     filtered = filter_items(items, search, selected)
-    st.caption(f"当前栏目：{tab} · 结果：{len(filtered)} / {len(items)}")
+    path = f"{tab} / {selected}" if selected else tab
+    st.caption(f"当前路径：{path} · 结果：{len(filtered)} / {len(items)}")
 
     if not filtered:
         st.warning("没有匹配项，试试更短关键词或切换分类。")
