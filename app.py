@@ -782,7 +782,7 @@ def fetch_ai_news(max_per_feed: int, include_community: bool = False, nonce: int
 
 
 def ensure_state(data: dict) -> None:
-    st.session_state.setdefault("active_tab", (data.get("tabs") or ["AI工具"])[0])
+    st.session_state.setdefault("active_tab", (data.get("tabs") or [AI_NEWS_TAB])[0])
     st.session_state.setdefault("search", "")
     st.session_state.setdefault("category_by_tab", {})
 
@@ -1797,14 +1797,6 @@ def render_tools(data: dict, tab: str) -> None:
         category_key = f"category_{tab}"
         if category_key not in st.session_state or st.session_state[category_key] not in options:
             st.session_state[category_key] = default_category if default_category in options else "全部"
-        st.markdown(
-            f"""
-            <section class="subtag-wrap">
-                <div class="subtag-kicker">子标签筛选 · {escape(tab)}</div>
-            </section>
-            """,
-            unsafe_allow_html=True,
-        )
         selected = st.pills(
             f"{tab} 子标签",
             options,
@@ -1817,14 +1809,6 @@ def render_tools(data: dict, tab: str) -> None:
         if selected is None:
             selected = "全部"
         st.session_state["category_by_tab"][tab] = selected
-        st.markdown(
-            f"""
-            <section class="subtag-wrap" style="margin-top:-4px">
-                <div class="subtag-path">当前路径：{escape(tab)} / {escape(selected)}</div>
-            </section>
-            """,
-            unsafe_allow_html=True,
-        )
 
     search = st.text_input("搜索", key="search", placeholder=f"在「{tab}」下搜索名称、描述、标签")
 
@@ -1885,12 +1869,21 @@ def render_tools(data: dict, tab: str) -> None:
 
 
 def render_ai_news_tab(data: dict | None = None) -> None:
+    _install_news_auto_refresh()
+    _bump_news_nonce_if_new_window()
+
     st.subheader(AI_NEWS_TAB)
-    st.caption("实时滚动头条 + 热度趋势榜 + 长尾时间流，聚合多源 AI 资讯并自动去重。")
+    st.caption("实时滚动头条 + 热度趋势榜 + 长尾时间流，聚合多源 AI 资讯并自动去重（每30分钟自动刷新并拉取）。")
 
     with st.sidebar:
         st.markdown("### 快报设置")
-        max_per_feed = st.slider("每个来源抓取条数", min_value=5, max_value=30, value=12, key="news_per_feed")
+        max_per_feed = st.slider("每个来源抓取条数", min_value=4, max_value=30, value=8, key="news_per_feed")
+        quick_mode = st.toggle(
+            "极速模式（推荐）",
+            value=True,
+            key="news_quick_mode",
+            help="开启后仅抓取官方与媒体源，页面加载更快。",
+        )
         max_total = st.slider("页面最多展示事件", min_value=20, max_value=140, value=70, key="news_max_total")
         hot_count = st.slider("热榜展示条数", min_value=6, max_value=25, value=12, key="news_hot_count")
         if st.button("刷新快报", key="news_refresh"):
@@ -1898,7 +1891,9 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     nonce = int(st.session_state.get("news_nonce", 0))
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
-    events, errors = fetch_ai_news(max_per_feed=max_per_feed, nonce=nonce)
+    include_community = not bool(quick_mode)
+    active_feeds = _active_news_feeds(include_community=include_community)
+    events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=nonce)
     _ = errors  # diagnostics only, keep UI clean
 
     source_options = sorted({str(src) for ev in events for src in ev.get("sources", []) if str(src).strip()})
@@ -1968,7 +1963,8 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     breaking_events = breaking_events[:8]
 
     source_count = len({src for ev in filtered for src in ev.get("sources", [])})
-    st.caption(f"覆盖来源：{source_count} / {len(AI_NEWS_FEEDS)} · 聚合事件：{len(filtered)}")
+    mode_text = "极速模式" if quick_mode else "全量模式"
+    st.caption(f"{mode_text} · 覆盖来源：{source_count} / {len(active_feeds)} · 聚合事件：{len(filtered)}")
 
     if breaking_events:
         ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
