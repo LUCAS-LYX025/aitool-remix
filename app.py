@@ -4,7 +4,6 @@ import base64
 import json
 import re
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import escape, unescape
@@ -13,7 +12,6 @@ from urllib.parse import quote, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data.json"
@@ -21,7 +19,7 @@ ICON_DIR = BASE_DIR / "icons"
 ICON_NAME_MAP_PATH = ICON_DIR / "name_overrides.json"
 TEST_TOOLSET_TAB = "测试工程师常用工具集"
 TEST_TOOLSET_URL = "https://lucas-testtool-online.streamlit.app/"
-AI_NEWS_TAB = "🚀 前线快报"
+AI_NEWS_TAB = "🚀 前线快爆"
 AI_NEWS_FEEDS = [
     {
         "name": "Google 新闻（中文）",
@@ -50,11 +48,6 @@ AI_NEWS_FEEDS = [
 ]
 AI_UPCOMING_EVENTS: list[dict[str, str]] = []
 TIER_WEIGHT = {"S": 700, "A": 500, "B": 280}
-NEWS_FETCH_TIMEOUT = 4.2
-NEWS_FETCH_MAX_WORKERS = 8
-NEWS_AUTO_REFRESH_MINUTES = 30
-NEWS_AUTO_REFRESH_INTERVAL_SECONDS = NEWS_AUTO_REFRESH_MINUTES * 60
-NEWS_AUTO_REFRESH_INTERVAL_MS = NEWS_AUTO_REFRESH_INTERVAL_SECONDS * 1000
 
 
 @st.cache_data(show_spinner=False)
@@ -392,7 +385,7 @@ def _build_upcoming_events(data: dict | None = None) -> list[dict]:
             }
         )
     result.sort(key=lambda x: float(x.get("target_ts", 0)))
-    return result[:16]
+    return result[:8]
 
 
 def _relative_news_time(ts: float) -> str:
@@ -563,14 +556,14 @@ def _fetch_text(url: str, timeout: float = 6.0) -> str:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def _parse_feed_items(feed: dict, max_items: int, timeout: float = NEWS_FETCH_TIMEOUT) -> list[dict]:
+def _parse_feed_items(feed: dict, max_items: int) -> list[dict]:
     source_name = str(feed.get("name", "未知来源"))
     source_url = str(feed.get("url", ""))
     tier = str(feed.get("tier", "B")).upper()
     source_weight = int(feed.get("weight", TIER_WEIGHT.get(tier, 280)))
     region = str(feed.get("region", "INTL")).upper()
 
-    xml_text = _fetch_text(source_url, timeout=timeout)
+    xml_text = _fetch_text(source_url, timeout=7.0)
     root = ET.fromstring(xml_text)
     items: list[dict] = []
 
@@ -653,68 +646,23 @@ def _parse_feed_items(feed: dict, max_items: int, timeout: float = NEWS_FETCH_TI
     return items
 
 
-def _active_news_feeds(include_community: bool) -> list[dict]:
-    if include_community:
-        return AI_NEWS_FEEDS
-    return [x for x in AI_NEWS_FEEDS if str(x.get("tier", "B")).upper() != "B"]
-
-
-def _install_news_auto_refresh(interval_ms: int = NEWS_AUTO_REFRESH_INTERVAL_MS) -> None:
-    # Client-side timed page refresh while the page is open.
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const key = "__lucas_news_autorefresh_timer__";
-            if (window[key]) return;
-            window[key] = window.setTimeout(function() {{
-                try {{
-                    window.parent.location.reload();
-                }} catch (e) {{
-                    window.location.reload();
-                }}
-            }}, {int(interval_ms)});
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-
-def _bump_news_nonce_if_new_window(window_seconds: int = NEWS_AUTO_REFRESH_INTERVAL_SECONDS) -> None:
-    # Force one pull when entering a new auto-refresh window.
-    bucket = int(datetime.now(timezone.utc).timestamp() // max(1, int(window_seconds)))
-    prev_bucket = st.session_state.get("news_auto_pull_bucket")
-    st.session_state["news_auto_pull_bucket"] = bucket
-    if prev_bucket is not None and int(prev_bucket) != bucket:
-        st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
-
-
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_ai_news(max_per_feed: int, include_community: bool = False, nonce: int = 0) -> tuple[list[dict], list[str]]:
+def fetch_ai_news(max_per_feed: int, nonce: int = 0) -> tuple[list[dict], list[str]]:
     _ = nonce  # cache-buster by refresh button
     all_items: list[dict] = []
     errors: list[str] = []
-    feeds = _active_news_feeds(include_community=include_community)
-    if not feeds:
-        return [], []
-
-    max_workers = min(NEWS_FETCH_MAX_WORKERS, max(1, len(feeds)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_parse_feed_items, feed, max_per_feed, NEWS_FETCH_TIMEOUT): feed for feed in feeds}
-        for future in as_completed(future_map):
-            feed = future_map[future]
-            name = str(feed.get("name", "未知来源"))
-            try:
-                all_items.extend(future.result())
-            except Exception as exc:
-                errors.append(f"{name} 抓取失败：{exc}")
+    for feed in AI_NEWS_FEEDS:
+        name = str(feed.get("name", "未知来源"))
+        try:
+            all_items.extend(_parse_feed_items(feed, max_per_feed))
+        except Exception as exc:
+            errors.append(f"{name} 抓取失败：{exc}")
     events = _build_news_events(all_items)
     return events, errors
 
 
 def ensure_state(data: dict) -> None:
-    st.session_state.setdefault("active_tab", (data.get("tabs") or [AI_NEWS_TAB])[0])
+    st.session_state.setdefault("active_tab", (data.get("tabs") or ["AI工具"])[0])
     st.session_state.setdefault("search", "")
     st.session_state.setdefault("category_by_tab", {})
 
@@ -841,48 +789,6 @@ def render_header(meta: dict) -> None:
         .stRadio [role="radiogroup"] label:hover {
             border-color: #7db2df;
             box-shadow: 0 4px 14px rgba(28, 111, 173, 0.12);
-        }
-
-        .subtag-wrap {
-            border: 1px solid #d6e5f2;
-            border-radius: 13px;
-            background: linear-gradient(165deg, #ffffff, #f5faff);
-            padding: 10px 12px 7px;
-            margin-bottom: 10px;
-        }
-
-        .subtag-kicker {
-            font-size: 0.74rem;
-            color: #55748f;
-            font-weight: 700;
-            margin-bottom: 6px;
-        }
-
-        .subtag-path {
-            font-size: 0.8rem;
-            color: #6a839a;
-            margin-top: 4px;
-        }
-
-        [data-testid="stPills"] [role="radiogroup"] {
-            gap: 6px;
-            row-gap: 7px;
-        }
-
-        [data-testid="stPills"] [role="radiogroup"] label {
-            border: 1px solid #cfe1f0;
-            border-radius: 999px;
-            padding: 5px 11px;
-            background: #f3f9ff;
-            color: #36536b;
-            font-size: 0.8rem;
-            font-weight: 700;
-            transition: 0.16s ease;
-        }
-
-        [data-testid="stPills"] [role="radiogroup"] label:hover {
-            border-color: #88b4d9;
-            background: #eaf5ff;
         }
 
         .card-link {
@@ -1723,46 +1629,21 @@ def render_tools(data: dict, tab: str) -> None:
     if categories and default_category not in ["全部", *categories]:
         default_category = "全部"
 
-    selected: str | None = None
-    if categories:
-        options = ["全部", *categories]
-        category_key = f"category_{tab}"
-        if category_key not in st.session_state or st.session_state[category_key] not in options:
-            st.session_state[category_key] = default_category if default_category in options else "全部"
-        st.markdown(
-            f"""
-            <section class="subtag-wrap">
-                <div class="subtag-kicker">子标签筛选 · {escape(tab)}</div>
-            </section>
-            """,
-            unsafe_allow_html=True,
-        )
-        selected = st.pills(
-            f"{tab} 子标签",
-            options,
-            selection_mode="single",
-            default=st.session_state[category_key],
-            key=category_key,
-            label_visibility="collapsed",
-            width="stretch",
-        )
-        if selected is None:
-            selected = "全部"
-        st.session_state["category_by_tab"][tab] = selected
-        st.markdown(
-            f"""
-            <section class="subtag-wrap" style="margin-top:-4px">
-                <div class="subtag-path">当前路径：{escape(tab)} / {escape(selected)}</div>
-            </section>
-            """,
-            unsafe_allow_html=True,
-        )
+    with st.sidebar:
+        if categories:
+            options = ["全部", *categories]
+            category_key = f"category_{tab}"
+            if category_key not in st.session_state or st.session_state[category_key] not in options:
+                st.session_state[category_key] = default_category if default_category in options else "全部"
+            selected = st.radio("分类", options, key=category_key)
+            st.session_state["category_by_tab"][tab] = selected
+        else:
+            selected = None
 
-    search = st.text_input("搜索", key="search", placeholder=f"在「{tab}」下搜索名称、描述、标签")
+    search = st.text_input("搜索", key="search", placeholder="输入名称、描述、标签")
 
     filtered = filter_items(items, search, selected)
-    path = f"{tab} / {selected}" if selected else tab
-    st.caption(f"当前路径：{path} · 结果：{len(filtered)} / {len(items)}")
+    st.caption(f"当前栏目：{tab} · 结果：{len(filtered)} / {len(items)}")
 
     if not filtered:
         st.warning("没有匹配项，试试更短关键词或切换分类。")
@@ -1817,16 +1698,12 @@ def render_tools(data: dict, tab: str) -> None:
 
 
 def render_ai_news_tab(data: dict | None = None) -> None:
-    _install_news_auto_refresh()
-    _bump_news_nonce_if_new_window()
-
     st.subheader(AI_NEWS_TAB)
-    st.caption("实时滚动头条 + 热度趋势榜 + 长尾时间流，聚合多源 AI 资讯并自动去重（每30分钟自动刷新并拉取）。")
+    st.caption("实时滚动头条 + 热度趋势榜 + 长尾时间流，聚合多源 AI 资讯并自动去重。")
 
     with st.sidebar:
         st.markdown("### 快报设置")
-        max_per_feed = st.slider("每个来源抓取条数", min_value=4, max_value=30, value=8, key="news_per_feed")
-        quick_mode = st.toggle("极速模式（推荐）", value=True, key="news_quick_mode", help="开启后仅抓取官方与媒体源，页面加载更快。")
+        max_per_feed = st.slider("每个来源抓取条数", min_value=5, max_value=30, value=12, key="news_per_feed")
         max_total = st.slider("页面最多展示事件", min_value=20, max_value=140, value=70, key="news_max_total")
         hot_count = st.slider("热榜展示条数", min_value=6, max_value=25, value=12, key="news_hot_count")
         if st.button("刷新快报", key="news_refresh"):
@@ -1834,9 +1711,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     nonce = int(st.session_state.get("news_nonce", 0))
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
-    include_community = not bool(quick_mode)
-    active_feeds = _active_news_feeds(include_community=include_community)
-    events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=nonce)
+    events, errors = fetch_ai_news(max_per_feed=max_per_feed, nonce=nonce)
     _ = errors  # diagnostics only, keep UI clean
 
     source_options = sorted({str(src) for ev in events for src in ev.get("sources", []) if str(src).strip()})
@@ -1906,8 +1781,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     breaking_events = breaking_events[:8]
 
     source_count = len({src for ev in filtered for src in ev.get("sources", [])})
-    mode_text = "极速模式" if quick_mode else "全量模式"
-    st.caption(f"{mode_text} · 覆盖来源：{source_count} / {len(active_feeds)} · 聚合事件：{len(filtered)}")
+    st.caption(f"覆盖来源：{source_count} / {len(AI_NEWS_FEEDS)} · 聚合事件：{len(filtered)}")
 
     if breaking_events:
         ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
