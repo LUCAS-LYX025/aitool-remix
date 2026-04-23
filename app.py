@@ -48,6 +48,54 @@ AI_NEWS_FEEDS = [
     {"name": "Reddit r/MachineLearning", "url": "https://www.reddit.com/r/MachineLearning/.rss", "tier": "B", "weight": 320, "region": "COMMUNITY"},
     {"name": "Hugging Face Blog", "url": "https://huggingface.co/blog/feed.xml", "tier": "S", "weight": 660, "region": "OFFICIAL"},
 ]
+CLAUDE_NEWS_KEYWORDS = (
+    "claude",
+    "claude ai",
+    "claude code",
+    "anthropic",
+    "anthropic ai",
+    "克劳德",
+)
+CODEX_NEWS_KEYWORDS = (
+    "codex",
+    "openai codex",
+    "chatgpt codex",
+)
+FEATURE_SIGNAL_KEYWORDS = (
+    "release",
+    "released",
+    "launch",
+    "launched",
+    "announce",
+    "announced",
+    "rollout",
+    "rolling out",
+    "ship",
+    "shipping",
+    "new feature",
+    "feature",
+    "capability",
+    "update",
+    "updated",
+    "upgrade",
+    "improve",
+    "improvement",
+    "changelog",
+    "version",
+    "preview",
+    "beta",
+    "availability",
+    "上线",
+    "发布",
+    "更新",
+    "升级",
+    "新增",
+    "功能",
+    "能力",
+    "改进",
+    "版本",
+    "预览",
+)
 AI_UPCOMING_EVENTS: list[dict[str, str]] = []
 TIER_WEIGHT = {"S": 700, "A": 500, "B": 280}
 NEWS_FETCH_TIMEOUT = 4.2
@@ -57,6 +105,13 @@ NEWS_SNAPSHOT_PATH = BASE_DIR / ".cache" / "ai_news_snapshot.json"
 NEWS_AUTO_REFRESH_MINUTES = 30
 NEWS_AUTO_REFRESH_INTERVAL_SECONDS = NEWS_AUTO_REFRESH_MINUTES * 60
 NEWS_AUTO_REFRESH_INTERVAL_MS = NEWS_AUTO_REFRESH_INTERVAL_SECONDS * 1000
+SKILL_HOTSPOT_FETCH_TIMEOUT = 4.2
+SKILL_HOTSPOT_MAX_WORKERS = 6
+SKILL_HOTSPOT_REFRESH_MINUTES = 60
+SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS = SKILL_HOTSPOT_REFRESH_MINUTES * 60
+SKILL_HOTSPOT_REFRESH_INTERVAL_MS = SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS * 1000
+SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS = SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS
+SKILL_HOTSPOT_SNAPSHOT_PATH = BASE_DIR / ".cache" / "skill_hotspots_snapshot.json"
 
 
 @st.cache_data(show_spinner=False)
@@ -397,6 +452,225 @@ def _build_upcoming_events(data: dict | None = None) -> list[dict]:
     return result[:8]
 
 
+def _parse_github_repo(url: str) -> tuple[str, str] | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host not in {"github.com", "www.github.com"}:
+            return None
+        parts = [x for x in parsed.path.split("/") if x]
+        if len(parts) < 2:
+            return None
+        owner = parts[0].strip()
+        repo = parts[1].strip()
+        if not owner or not repo:
+            return None
+        repo = repo.removesuffix(".git")
+        return owner, repo
+    except Exception:
+        return None
+
+
+def _extract_skill_repo_key(item: dict) -> str:
+    for key in ("downloadUrl", "url"):
+        repo = _parse_github_repo(str(item.get(key, "")).strip())
+        if repo:
+            return f"{repo[0]}/{repo[1]}"
+    return ""
+
+
+def _format_compact_count(value: int) -> str:
+    n = max(0, int(value))
+    if n >= 1_000_000:
+        text = f"{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        text = f"{n / 1_000:.1f}k"
+    else:
+        text = str(n)
+    return text.replace(".0", "")
+
+
+def _skill_star_score(raw: object) -> float:
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw or "").strip().lower().replace(",", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([mk]?)", text)
+    if not match:
+        return 0.0
+    number = float(match.group(1))
+    unit = match.group(2)
+    if unit == "m":
+        return number * 1_000_000.0
+    if unit == "k":
+        return number * 1_000.0
+    return number
+
+
+def _fetch_github_repo_meta(repo_key: str, timeout: float = SKILL_HOTSPOT_FETCH_TIMEOUT) -> dict | None:
+    api_url = f"https://api.github.com/repos/{quote(repo_key, safe='/')}"
+    req = Request(
+        api_url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    if isinstance(payload, dict) and str(payload.get("full_name", "")).strip():
+        return payload
+    return None
+
+
+def _collect_skill_hotspots_live(seed_groups: list[dict]) -> tuple[list[dict], list[str]]:
+    repo_keys: list[str] = []
+    for group in seed_groups:
+        if not isinstance(group, dict):
+            continue
+        items = group.get("items", []) or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            repo_key = _extract_skill_repo_key(item)
+            if repo_key and repo_key not in repo_keys:
+                repo_keys.append(repo_key)
+
+    repo_meta: dict[str, dict] = {}
+    errors: list[str] = []
+    if repo_keys:
+        max_workers = min(SKILL_HOTSPOT_MAX_WORKERS, max(1, len(repo_keys)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_fetch_github_repo_meta, repo_key): repo_key for repo_key in repo_keys}
+            for future in as_completed(future_map):
+                repo_key = future_map[future]
+                try:
+                    meta = future.result()
+                    if isinstance(meta, dict):
+                        repo_meta[repo_key] = meta
+                except Exception as exc:
+                    errors.append(f"{repo_key} 拉取失败：{exc}")
+
+    china_tz = timezone(timedelta(hours=8))
+    now_label = datetime.now(china_tz).strftime("%Y-%m-%d %H:%M")
+    refreshed: list[dict] = []
+    for group in seed_groups:
+        if not isinstance(group, dict):
+            continue
+        group_out = dict(group)
+        items = group.get("items", []) or []
+        items_out: list[dict] = []
+        group_updated = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_out = dict(item)
+            repo_key = _extract_skill_repo_key(item_out)
+            meta = repo_meta.get(repo_key) if repo_key else None
+            if isinstance(meta, dict):
+                group_updated = True
+                stars = meta.get("stargazers_count")
+                if isinstance(stars, int) and stars >= 0:
+                    item_out["star"] = f"≈{_format_compact_count(stars)}"
+                pushed_at = str(meta.get("pushed_at", "")).strip()
+                pushed_dt = _parse_news_time(pushed_at)
+                if pushed_dt is not None:
+                    item_out["freshAt"] = _format_news_time(pushed_dt)
+            items_out.append(item_out)
+        items_out.sort(key=lambda x: _skill_star_score(x.get("star")), reverse=True)
+        group_out["items"] = items_out
+        if group_updated:
+            group_out["updatedAt"] = f"{now_label}（自动）"
+        refreshed.append(group_out)
+    return refreshed, errors
+
+
+def _read_skill_hotspots_snapshot(max_age_seconds: int = SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS) -> list[dict] | None:
+    try:
+        if not SKILL_HOTSPOT_SNAPSHOT_PATH.exists():
+            return None
+        raw = json.loads(SKILL_HOTSPOT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        updated_ts = int(raw.get("updated_ts", 0) or 0)
+        groups = raw.get("groups", [])
+        if not isinstance(groups, list):
+            return None
+        if max_age_seconds > 0:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if updated_ts <= 0 or now_ts - updated_ts > max_age_seconds:
+                return None
+        return [x for x in groups if isinstance(x, dict)]
+    except Exception:
+        return None
+
+
+def _write_skill_hotspots_snapshot(groups: list[dict]) -> None:
+    try:
+        SKILL_HOTSPOT_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_ts": int(datetime.now(timezone.utc).timestamp()),
+            "groups": groups,
+        }
+        tmp_path = SKILL_HOTSPOT_SNAPSHOT_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(SKILL_HOTSPOT_SNAPSHOT_PATH)
+    except Exception:
+        return
+
+
+def _install_skillhot_auto_refresh(interval_ms: int = SKILL_HOTSPOT_REFRESH_INTERVAL_MS) -> None:
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const key = "__lucas_skillhot_autorefresh_timer__";
+            if (window[key]) return;
+            window[key] = window.setTimeout(function() {{
+                try {{
+                    window.parent.location.reload();
+                }} catch (e) {{
+                    window.location.reload();
+                }}
+            }}, {int(interval_ms)});
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _bump_skillhot_nonce_if_new_window(window_seconds: int = SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS) -> None:
+    bucket = int(datetime.now(timezone.utc).timestamp() // max(1, int(window_seconds)))
+    prev_bucket = st.session_state.get("skillhot_auto_pull_bucket")
+    st.session_state["skillhot_auto_pull_bucket"] = bucket
+    if prev_bucket is not None and int(prev_bucket) != bucket:
+        st.session_state["skillhot_nonce"] = int(st.session_state.get("skillhot_nonce", 0)) + 1
+
+
+@st.cache_data(show_spinner=False, ttl=SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS)
+def fetch_skill_hotspots(seed_groups: list[dict], nonce: int = 0) -> tuple[list[dict], list[str]]:
+    _ = nonce  # cache-buster by manual/auto refresh
+    groups_seed = [x for x in seed_groups if isinstance(x, dict)]
+
+    if nonce == 0:
+        snapshot = _read_skill_hotspots_snapshot(max_age_seconds=SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS)
+        if snapshot:
+            return snapshot, []
+
+    refreshed, errors = _collect_skill_hotspots_live(groups_seed)
+    if refreshed:
+        _write_skill_hotspots_snapshot(refreshed)
+        return refreshed, errors
+
+    fallback = _read_skill_hotspots_snapshot(max_age_seconds=30 * 24 * 3600)
+    if fallback:
+        return fallback, errors
+    return groups_seed, errors
+
+
 def _relative_news_time(ts: float) -> str:
     if not ts:
         return "时间未知"
@@ -426,6 +700,56 @@ def _emotion_tag(text: str) -> str:
     if any(k in t for k in ["发布", "release", "launch", "上线", "融资", "增长", "突破", "升级"]):
         return "📈 利好"
     return "💡 观察"
+
+
+def _event_blob(ev: dict) -> str:
+    return " ".join(
+        [
+            str(ev.get("title", "")),
+            str(ev.get("summary", "")),
+            str(ev.get("source", "")),
+            str(ev.get("source_line", "")),
+            " ".join(str(x) for x in ev.get("sources", [])),
+        ]
+    ).lower()
+
+
+def _classify_claude_codex_topic(ev: dict) -> str | None:
+    blob = _event_blob(ev)
+    has_claude = any(k in blob for k in CLAUDE_NEWS_KEYWORDS)
+    has_codex = any(k in blob for k in CODEX_NEWS_KEYWORDS)
+    if not (has_claude or has_codex):
+        return None
+
+    has_feature_signal = any(k in blob for k in FEATURE_SIGNAL_KEYWORDS)
+    source_blob = " ".join([str(ev.get("source", "")), str(ev.get("source_line", ""))]).lower()
+    is_official_source = any(k in source_blob for k in ["anthropic", "openai"])
+    if not has_feature_signal and not is_official_source:
+        return None
+
+    if has_claude and has_codex:
+        return "Claude + Codex"
+    return "Claude" if has_claude else "Codex"
+
+
+def _collect_claude_codex_feature_events(events: list[dict], limit: int) -> list[dict]:
+    max_items = max(1, int(limit))
+    ranked = sorted(
+        events,
+        key=lambda x: (float(x.get("timestamp", 0)), float(x.get("heat_score", 0))),
+        reverse=True,
+    )
+    picked: list[dict] = []
+    for ev in ranked:
+        topic = _classify_claude_codex_topic(ev)
+        if not topic:
+            continue
+        row = dict(ev)
+        row["agent_topic"] = topic
+        picked.append(row)
+        if len(picked) >= max_items:
+            break
+    return picked
 
 
 def _normalize_title(text: str) -> str:
@@ -1268,6 +1592,36 @@ def render_header(meta: dict) -> None:
             color: #597086;
         }
 
+        .agent-hot-card {
+            border-color: #d1e7f8;
+            background: linear-gradient(165deg, #ffffff, #f5fbff);
+        }
+
+        .agent-topic-tag {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 3px 9px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            border: 1px solid #bedef3;
+            background: linear-gradient(90deg, #edf8ff, #eef5ff);
+            color: #2f6488;
+            white-space: nowrap;
+        }
+
+        .agent-topic-tag.codex {
+            border-color: #d5daf9;
+            background: linear-gradient(90deg, #f4f1ff, #edf2ff);
+            color: #3f4f9a;
+        }
+
+        .agent-topic-tag.dual {
+            border-color: #ffd2b7;
+            background: linear-gradient(90deg, #fff1e6, #eef6ff);
+            color: #8f4f22;
+        }
+
         .breaking-wrap {
             margin-bottom: 12px;
             border: 1px solid #f1c9c9;
@@ -1896,9 +2250,35 @@ def render_announcement(data: dict) -> None:
 
 
 def render_skill_hotspots(data: dict) -> None:
-    groups = data.get("skillHotspots", [])
-    if not groups:
+    seed_groups = data.get("skillHotspots", [])
+    if not seed_groups:
         return
+
+    with st.sidebar:
+        st.markdown("### Skill 热点设置")
+        auto_collect = st.toggle(
+            "定时收集更新",
+            value=True,
+            key="skillhot_auto_collect",
+            help=f"开启后每 {SKILL_HOTSPOT_REFRESH_MINUTES} 分钟自动拉取一次热点 Skill 仓库信息。",
+        )
+        if st.button("刷新热点 Skill", key="skillhot_refresh"):
+            st.session_state["skillhot_nonce"] = int(st.session_state.get("skillhot_nonce", 0)) + 1
+
+    if auto_collect:
+        _install_skillhot_auto_refresh()
+        _bump_skillhot_nonce_if_new_window()
+
+    nonce = int(st.session_state.get("skillhot_nonce", 0))
+    groups = seed_groups
+    fetch_errors: list[str] = []
+    if auto_collect or nonce > 0:
+        groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=nonce)
+
+    if auto_collect:
+        st.caption(f"自动收集间隔：每 {SKILL_HOTSPOT_REFRESH_MINUTES} 分钟（支持手动刷新）")
+    else:
+        st.caption("当前使用静态热点 Skill 数据（已关闭定时收集）")
 
     group_html: list[str] = []
     for group in groups:
@@ -1912,6 +2292,7 @@ def render_skill_hotspots(data: dict) -> None:
             desc = escape(str(item.get("summary", "暂无说明")))
             download_url = str(item.get("downloadUrl", "")).strip()
             download_cmd = escape(str(item.get("downloadCmd", "")).strip())
+            fresh_at = escape(str(item.get("freshAt", "")).strip())
             download_html = (
                 f"<a href='{escape(download_url, quote=True)}' target='_blank' rel='noopener noreferrer'>下载地址</a>"
                 if download_url
@@ -1920,6 +2301,7 @@ def render_skill_hotspots(data: dict) -> None:
             scenarios = item.get("scenarios", []) or []
             scenario_html = "".join(f"<span class='skillhot-tag'>{escape(str(x))}</span>" for x in scenarios[:5])
             cmd_html = f"<div class='skillhot-row'>命令：<code>{download_cmd}</code></div>" if download_cmd else ""
+            fresh_html = f"<div class='skillhot-row'>最近提交：{fresh_at}</div>" if fresh_at else ""
             cards.append(
                 "<article class='skillhot-card'>"
                 "<div class='skillhot-top'>"
@@ -1929,6 +2311,7 @@ def render_skill_hotspots(data: dict) -> None:
                 f"<div class='skillhot-desc'>{desc}</div>"
                 f"<div class='skillhot-row'>下载：{download_html}</div>"
                 f"{cmd_html}"
+                f"{fresh_html}"
                 f"<div class='skillhot-tags'>{scenario_html}</div>"
                 "</article>"
             )
@@ -1948,6 +2331,8 @@ def render_skill_hotspots(data: dict) -> None:
         ),
         unsafe_allow_html=True,
     )
+    if fetch_errors:
+        st.caption(f"自动采集提示：{len(fetch_errors)} 个仓库本轮拉取失败，已自动回退缓存/静态数据。")
 
 
 def render_tools(data: dict, tab: str) -> None:
@@ -2052,6 +2437,13 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         )
         max_total = st.slider("页面最多展示事件", min_value=20, max_value=140, value=70, key="news_max_total")
         hot_count = st.slider("热榜展示条数", min_value=6, max_value=25, value=12, key="news_hot_count")
+        agent_focus_count = st.slider(
+            "Claude/Codex 专区条数",
+            min_value=4,
+            max_value=24,
+            value=10,
+            key="news_agent_focus_count",
+        )
         if st.button("刷新快报", key="news_refresh"):
             st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
     nonce = int(st.session_state.get("news_nonce", 0))
@@ -2121,6 +2513,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     tail_events = [x for x in timeline_events if str(x.get("id", "")) not in hot_ids]
     if len(tail_events) < 8:
         tail_events = timeline_events
+    agent_events = _collect_claude_codex_feature_events(filtered, limit=agent_focus_count)
 
     breaking_events = [x for x in timeline_events if bool(x.get("is_breaking")) and now_ts - float(x.get("timestamp", 0)) <= 2 * 3600]
     if not breaking_events:
@@ -2130,7 +2523,9 @@ def render_ai_news_tab(data: dict | None = None) -> None:
 
     source_count = len({src for ev in filtered for src in ev.get("sources", [])})
     mode_text = "极速模式" if quick_mode else "全量模式"
-    st.caption(f"{mode_text} · 覆盖来源：{source_count} / {len(active_feeds)} · 聚合事件：{len(filtered)}")
+    st.caption(
+        f"{mode_text} · 覆盖来源：{source_count} / {len(active_feeds)} · 聚合事件：{len(filtered)} · Claude/Codex 专栏：{len(agent_events)}"
+    )
 
     if breaking_events:
         ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
@@ -2195,6 +2590,56 @@ def render_ai_news_tab(data: dict | None = None) -> None:
             ),
             unsafe_allow_html=True,
         )
+
+    def _agent_card(ev: dict) -> str:
+        topic = str(ev.get("agent_topic", "Claude/Codex"))
+        topic_cls = " dual" if topic == "Claude + Codex" else (" codex" if topic == "Codex" else "")
+        related = int(ev.get("related_count", 0))
+        related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
+        link = escape(str(ev.get("link", "")), quote=True)
+        return (
+            f"<a class='card-link hot-card-link' href='{link}' target='_blank' rel='noopener noreferrer'>"
+            f"<article class='hot-card agent-hot-card'>"
+            f"<div class='hot-top'>"
+            f"<div class='hot-left'>"
+            f"<span class='agent-topic-tag{topic_cls}'>{escape(topic)} 功能</span>"
+            f"<span class='hot-tier'>{escape(str(ev.get('tier', 'B')))}级来源</span>"
+            f"</div>"
+            f"<span class='news-time'>{escape(str(ev.get('relative_time', '时间未知')))}</span>"
+            f"</div>"
+            f"<div class='hot-title'>{escape(str(ev.get('title', '无标题')))}</div>"
+            f"<div class='news-summary'>{escape(str(ev.get('summary', '核心看点：点击查看详情。')))}</div>"
+            f"<div class='news-source-line'>参考来源：{escape(str(ev.get('source_line', '未知来源')))}</div>"
+            f"{related_html}"
+            f"<div class='hot-meta-line'>"
+            f"<span class='news-time'>{escape(str(ev.get('published_at', '时间未知')))}</span>"
+            f"<span class='news-time'>热度 {int(ev.get('heat_score', 0))}</span>"
+            f"</div>"
+            f"</article>"
+            f"</a>"
+        )
+
+    if agent_events:
+        agent_rows = "".join(_agent_card(ev) for ev in agent_events)
+    else:
+        agent_rows = (
+            "<article class='hot-card agent-hot-card'>"
+            "<div class='hot-title'>当前筛选下暂无 Claude/Codex 功能资讯</div>"
+            "<div class='news-summary'>可以放宽关键词/时间范围，或点击“刷新快报”获取新一轮聚合结果。</div>"
+            "</article>"
+        )
+    st.markdown(
+        (
+            "<section class='news-shell'>"
+            "<div class='news-head'>"
+            "<div class='news-title-main'>Claude / Codex 最新功能资讯</div>"
+            "<div class='news-meta'>聚焦版本发布、功能更新、能力升级（按时间优先）</div>"
+            "</div>"
+            f"<div class='hot-grid'>{agent_rows}</div>"
+            "</section>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     def _hot_card(idx: int, ev: dict) -> str:
         rank_cls = f" rank-{idx}" if idx <= 3 else ""

@@ -23,6 +23,7 @@
 - `🚀 前线快报`：实时滚动头条 + 热度趋势榜 + 普通时间流
 - 支持 `aiUpcomingEvents` 倒计时卡片（可配置发布会/截稿节点）
 - `🚀 前线快报` 页面默认每 30 分钟自动刷新并触发新一轮拉取
+- `Skill` 热点支持定时收集更新（默认每 60 分钟拉取 GitHub Star/最近提交时间）
 - 公告区支持富样式信息卡与 CTA 按钮
 - 图标优先本地命中，缺失时自动走 favicon 兜底
 
@@ -94,6 +95,7 @@ aitool-remix/
 - 分组字段：`category`, `updatedAt`, `items`
 - 条目字段：`name`, `star`, `summary`, `downloadUrl`, `downloadCmd`, `scenarios`
 - `Skill` Tab 会自动渲染“热点 Skill 分类汇总”卡片
+- `downloadUrl` 或 `url` 为 GitHub 仓库时，页面会定时自动刷新 `star` 和最近提交时间（`freshAt`）
 
 ## 图标策略（应用内）
 
