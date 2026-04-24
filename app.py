@@ -99,8 +99,9 @@ FEATURE_SIGNAL_KEYWORDS = (
 AI_UPCOMING_EVENTS: list[dict[str, str]] = []
 TIER_WEIGHT = {"S": 700, "A": 500, "B": 280}
 NEWS_FETCH_TIMEOUT = 4.2
-NEWS_FETCH_MAX_WORKERS = 8
+NEWS_FETCH_MAX_WORKERS = 12
 NEWS_SNAPSHOT_TTL_SECONDS = 900
+NEWS_STALE_SNAPSHOT_MAX_AGE_SECONDS = 7 * 24 * 3600
 NEWS_SNAPSHOT_PATH = BASE_DIR / ".cache" / "ai_news_snapshot.json"
 NEWS_AUTO_REFRESH_MINUTES = 30
 NEWS_AUTO_REFRESH_INTERVAL_SECONDS = NEWS_AUTO_REFRESH_MINUTES * 60
@@ -111,7 +112,10 @@ SKILL_HOTSPOT_REFRESH_MINUTES = 60
 SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS = SKILL_HOTSPOT_REFRESH_MINUTES * 60
 SKILL_HOTSPOT_REFRESH_INTERVAL_MS = SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS * 1000
 SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS = SKILL_HOTSPOT_REFRESH_INTERVAL_SECONDS
+SKILL_HOTSPOT_STALE_SNAPSHOT_MAX_AGE_SECONDS = 30 * 24 * 3600
 SKILL_HOTSPOT_SNAPSHOT_PATH = BASE_DIR / ".cache" / "skill_hotspots_snapshot.json"
+STALE_NEWS_SNAPSHOT_MARK = "__stale_news_snapshot__"
+STALE_SKILLHOT_SNAPSHOT_MARK = "__stale_skillhot_snapshot__"
 
 
 @st.cache_data(show_spinner=False)
@@ -120,7 +124,7 @@ def load_data() -> dict:
         return json.load(f)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_local_icon_data_uri() -> dict[str, str]:
     def to_data_uri(path: Path) -> str:
         raw = path.read_bytes()
@@ -149,7 +153,7 @@ def load_local_icon_data_uri() -> dict[str, str]:
     return mapping
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_icon_name_overrides() -> dict[str, str]:
     if not ICON_NAME_MAP_PATH.exists():
         return {}
@@ -195,13 +199,17 @@ def favicon_fallback_2(url: str) -> str:
     return f"https://icons.duckduckgo.com/ip3/{quote(host, safe='')}.ico" if host else ""
 
 
-def specific_icon_override(item: dict) -> str:
+def specific_icon_override(
+    item: dict,
+    local: dict[str, str] | None = None,
+    name_overrides: dict[str, str] | None = None,
+) -> str:
     """Pin reliable icons for known problematic domains/cards."""
     host = get_hostname(str(item.get("url", ""))).lower()
     name_raw = str(item.get("name", "")).strip()
     name = name_raw.lower()
-    local = load_local_icon_data_uri()
-    name_overrides = load_icon_name_overrides()
+    local = local if local is not None else load_local_icon_data_uri()
+    name_overrides = name_overrides if name_overrides is not None else load_icon_name_overrides()
 
     # 0) Name override mapping generated from icons/name_overrides.json.
     mapped_stem = name_overrides.get(name_raw, "")
@@ -659,13 +667,16 @@ def fetch_skill_hotspots(seed_groups: list[dict], nonce: int = 0) -> tuple[list[
         snapshot = _read_skill_hotspots_snapshot(max_age_seconds=SKILL_HOTSPOT_SNAPSHOT_TTL_SECONDS)
         if snapshot:
             return snapshot, []
+        stale_snapshot = _read_skill_hotspots_snapshot(max_age_seconds=SKILL_HOTSPOT_STALE_SNAPSHOT_MAX_AGE_SECONDS)
+        if stale_snapshot:
+            return stale_snapshot, [STALE_SKILLHOT_SNAPSHOT_MARK]
 
     refreshed, errors = _collect_skill_hotspots_live(groups_seed)
     if refreshed:
         _write_skill_hotspots_snapshot(refreshed)
         return refreshed, errors
 
-    fallback = _read_skill_hotspots_snapshot(max_age_seconds=30 * 24 * 3600)
+    fallback = _read_skill_hotspots_snapshot(max_age_seconds=SKILL_HOTSPOT_STALE_SNAPSHOT_MAX_AGE_SECONDS)
     if fallback:
         return fallback, errors
     return groups_seed, errors
@@ -1078,6 +1089,12 @@ def fetch_ai_news(max_per_feed: int, include_community: bool = False, nonce: int
         snapshot_events = _read_news_snapshot(include_community=include_community, max_age_seconds=NEWS_SNAPSHOT_TTL_SECONDS)
         if snapshot_events:
             return snapshot_events, []
+        stale_snapshot_events = _read_news_snapshot(
+            include_community=include_community,
+            max_age_seconds=NEWS_STALE_SNAPSHOT_MAX_AGE_SECONDS,
+        )
+        if stale_snapshot_events:
+            return stale_snapshot_events, [STALE_NEWS_SNAPSHOT_MARK]
 
     feeds = _active_news_feeds(include_community=include_community)
     if not feeds:
@@ -1099,7 +1116,10 @@ def fetch_ai_news(max_per_feed: int, include_community: bool = False, nonce: int
         return events, errors
 
     # Fallback: if all sources fail, return latest snapshot (even stale).
-    fallback_events = _read_news_snapshot(include_community=include_community, max_age_seconds=30 * 24 * 3600)
+    fallback_events = _read_news_snapshot(
+        include_community=include_community,
+        max_age_seconds=NEWS_STALE_SNAPSHOT_MAX_AGE_SECONDS,
+    )
     if fallback_events:
         return fallback_events, errors
     return events, errors
@@ -1109,6 +1129,10 @@ def ensure_state(data: dict) -> None:
     st.session_state.setdefault("active_tab", (data.get("tabs") or [AI_NEWS_TAB])[0])
     st.session_state.setdefault("search", "")
     st.session_state.setdefault("category_by_tab", {})
+    st.session_state.setdefault("news_nonce", 0)
+    st.session_state.setdefault("news_nonce_applied", 0)
+    st.session_state.setdefault("skillhot_nonce", 0)
+    st.session_state.setdefault("skillhot_nonce_applied", 0)
 
     tabs = data.get("tabs", [])
     if st.session_state["active_tab"] not in tabs and tabs:
@@ -2270,15 +2294,26 @@ def render_skill_hotspots(data: dict) -> None:
         _bump_skillhot_nonce_if_new_window()
 
     nonce = int(st.session_state.get("skillhot_nonce", 0))
+    nonce_applied = int(st.session_state.get("skillhot_nonce_applied", 0))
+    fetch_nonce = nonce if nonce > nonce_applied else 0
     groups = seed_groups
     fetch_errors: list[str] = []
     if auto_collect or nonce > 0:
-        groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=nonce)
+        if fetch_nonce:
+            with st.spinner("正在刷新 Skill 热点数据..."):
+                groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=fetch_nonce)
+            st.session_state["skillhot_nonce_applied"] = nonce
+        else:
+            groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=0)
+    used_stale_snapshot = STALE_SKILLHOT_SNAPSHOT_MARK in fetch_errors
+    fetch_errors = [x for x in fetch_errors if x != STALE_SKILLHOT_SNAPSHOT_MARK]
 
     if auto_collect:
         st.caption(f"自动收集间隔：每 {SKILL_HOTSPOT_REFRESH_MINUTES} 分钟（支持手动刷新）")
     else:
         st.caption("当前使用静态热点 Skill 数据（已关闭定时收集）")
+    if used_stale_snapshot:
+        st.caption("已快速加载本地热点缓存，可点击“刷新热点 Skill”立即拉取最新仓库信息。")
 
     group_html: list[str] = []
     for group in groups:
@@ -2371,52 +2406,56 @@ def render_tools(data: dict, tab: str) -> None:
         st.warning("没有匹配项，试试更短关键词或切换分类。")
         return
 
-    cols = st.columns(3)
+    local_icons = load_local_icon_data_uri()
+    name_overrides = load_icon_name_overrides()
+    col_html = ["", "", ""]
     for i, item in enumerate(filtered):
-        with cols[i % 3]:
-            item_name = escape(item.get("name", "未命名"))
-            item_url = escape(item.get("url", ""), quote=True)
-            item_domain = escape(get_domain(item.get("url", "")))
-            forced_icon = specific_icon_override(item)
-            icon_primary = escape(forced_icon, quote=True) if forced_icon else escape(
-                favicon_primary(item.get("url", "")), quote=True
-            )
-            icon_fallback_1 = escape(favicon_fallback_1(item.get("url", "")), quote=True)
-            icon_fallback_2 = escape(favicon_fallback_2(item.get("url", "")), quote=True)
-            item_initial = escape((item.get("name", "？")[:1] or "？"))
-            item_desc = escape(item.get("description", "暂无描述")).replace("\n", "<br/>")
-            tags = "".join(f"<span class='tag'>{escape(str(t))}</span>" for t in item.get("tags", [])[:4])
-            category_html = (
-                f"<span class='card-category'>{escape(str(item.get('category')))}</span>" if item.get("category") else ""
-            )
-            card_html = (
-                f"<a class='card-link' href='{item_url}' target='_blank' rel='noopener noreferrer'>"
-                "<article class='card-wrap'>"
-                "<div class='card-top'>"
-                "<div class='card-left'>"
-                f"<img class='card-icon' src='{icon_primary}' data-fallback1='{icon_fallback_1}' data-fallback2='{icon_fallback_2}' "
-                "alt='' loading='lazy' "
-                "onerror=\"if(!this.dataset.tried1){this.dataset.tried1='1';this.src=this.dataset.fallback1;}else if(!this.dataset.tried2){this.dataset.tried2='1';this.src=this.dataset.fallback2;}else{this.style.display='none';this.nextElementSibling.style.display='grid';}\"/>"
-                f"<span class='card-icon-fallback' style='display:none'>{item_initial}</span>"
-                "<div class='card-title-wrap'>"
-                f"<div class='card-title' title='{item_name}'>{item_name}</div>"
-                f"<div class='card-meta' title='{item_domain}'>{item_domain}</div>"
-                "</div>"
-                "</div>"
-                f"{category_html}"
-                "</div>"
-                f"<div class='card-desc'>{item_desc}</div>"
-                "<div class='card-foot'>"
-                f"<div class='tags-wrap'>{tags}</div>"
-                "<span class='go-mark'>点击跳转</span>"
-                "</div>"
-                "</article>"
-                "</a>"
-            )
-            st.markdown(
-                card_html,
-                unsafe_allow_html=True,
-            )
+        item_name = escape(item.get("name", "未命名"))
+        item_url = escape(item.get("url", ""), quote=True)
+        item_domain = escape(get_domain(item.get("url", "")))
+        forced_icon = specific_icon_override(item, local=local_icons, name_overrides=name_overrides)
+        icon_primary = escape(forced_icon, quote=True) if forced_icon else escape(
+            favicon_primary(item.get("url", "")), quote=True
+        )
+        icon_fallback_1 = escape(favicon_fallback_1(item.get("url", "")), quote=True)
+        icon_fallback_2 = escape(favicon_fallback_2(item.get("url", "")), quote=True)
+        item_initial = escape((item.get("name", "？")[:1] or "？"))
+        item_desc = escape(item.get("description", "暂无描述")).replace("\n", "<br/>")
+        tags = "".join(f"<span class='tag'>{escape(str(t))}</span>" for t in item.get("tags", [])[:4])
+        category_html = (
+            f"<span class='card-category'>{escape(str(item.get('category')))}</span>" if item.get("category") else ""
+        )
+        card_html = (
+            f"<a class='card-link' href='{item_url}' target='_blank' rel='noopener noreferrer'>"
+            "<article class='card-wrap'>"
+            "<div class='card-top'>"
+            "<div class='card-left'>"
+            f"<img class='card-icon' src='{icon_primary}' data-fallback1='{icon_fallback_1}' data-fallback2='{icon_fallback_2}' "
+            "alt='' loading='lazy' "
+            "onerror=\"if(!this.dataset.tried1){this.dataset.tried1='1';this.src=this.dataset.fallback1;}else if(!this.dataset.tried2){this.dataset.tried2='1';this.src=this.dataset.fallback2;}else{this.style.display='none';this.nextElementSibling.style.display='grid';}\"/>"
+            f"<span class='card-icon-fallback' style='display:none'>{item_initial}</span>"
+            "<div class='card-title-wrap'>"
+            f"<div class='card-title' title='{item_name}'>{item_name}</div>"
+            f"<div class='card-meta' title='{item_domain}'>{item_domain}</div>"
+            "</div>"
+            "</div>"
+            f"{category_html}"
+            "</div>"
+            f"<div class='card-desc'>{item_desc}</div>"
+            "<div class='card-foot'>"
+            f"<div class='tags-wrap'>{tags}</div>"
+            "<span class='go-mark'>点击跳转</span>"
+            "</div>"
+            "</article>"
+            "</a>"
+        )
+        col_html[i % 3] += card_html
+
+    cols = st.columns(3)
+    for idx, col in enumerate(cols):
+        with col:
+            if col_html[idx]:
+                st.markdown(col_html[idx], unsafe_allow_html=True)
 
 
 def render_ai_news_tab(data: dict | None = None) -> None:
@@ -2447,12 +2486,20 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         if st.button("刷新快报", key="news_refresh"):
             st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
     nonce = int(st.session_state.get("news_nonce", 0))
+    nonce_applied = int(st.session_state.get("news_nonce_applied", 0))
+    fetch_nonce = nonce if nonce > nonce_applied else 0
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
     include_community = not bool(quick_mode)
     active_feeds = _active_news_feeds(include_community=include_community)
-    events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=nonce)
-    _ = errors  # diagnostics only, keep UI clean
+    if fetch_nonce:
+        with st.spinner("正在刷新前线快报..."):
+            events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=fetch_nonce)
+        st.session_state["news_nonce_applied"] = nonce
+    else:
+        events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=0)
+    used_stale_snapshot = STALE_NEWS_SNAPSHOT_MARK in errors
+    errors = [x for x in errors if x != STALE_NEWS_SNAPSHOT_MARK]
 
     source_options = sorted({str(src) for ev in events for src in ev.get("sources", []) if str(src).strip()})
     selected_sources = st.multiselect(
@@ -2526,6 +2573,10 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     st.caption(
         f"{mode_text} · 覆盖来源：{source_count} / {len(active_feeds)} · 聚合事件：{len(filtered)} · Claude/Codex 专栏：{len(agent_events)}"
     )
+    if used_stale_snapshot:
+        st.caption("已快速加载本地快照，可点击“刷新快报”立即抓取最新资讯。")
+    if errors:
+        st.caption(f"抓取提示：{len(errors)} 个来源本轮拉取失败，已自动回退可用数据。")
 
     if breaking_events:
         ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
