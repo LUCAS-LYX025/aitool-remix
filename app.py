@@ -990,6 +990,9 @@ def _write_skill_hotspots_snapshot(groups: list[dict]) -> None:
         tmp_path = SKILL_HOTSPOT_SNAPSHOT_PATH.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp_path.replace(SKILL_HOTSPOT_SNAPSHOT_PATH)
+        cache_fn = globals().get("fetch_skill_hotspots")
+        if cache_fn is not None and hasattr(cache_fn, "clear"):
+            cache_fn.clear()
     except Exception:
         return
 
@@ -1435,6 +1438,9 @@ def _write_news_snapshot(include_community: bool, events: list[dict]) -> None:
         tmp_path = NEWS_SNAPSHOT_PATH.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(root, ensure_ascii=False), encoding="utf-8")
         tmp_path.replace(NEWS_SNAPSHOT_PATH)
+        cache_fn = globals().get("fetch_ai_news")
+        if cache_fn is not None and hasattr(cache_fn, "clear"):
+            cache_fn.clear()
     except Exception:
         return
 
@@ -2694,16 +2700,17 @@ def render_skill_hotspots(data: dict) -> None:
 
     nonce = int(st.session_state.get("skillhot_nonce", 0))
     nonce_applied = int(st.session_state.get("skillhot_nonce_applied", 0))
-    fetch_nonce = nonce if nonce > nonce_applied else 0
+    refresh_nonce = nonce if nonce > nonce_applied else 0
+    query_nonce = nonce if nonce > 0 else 0
     groups = seed_groups
     fetch_errors: list[str] = []
     if auto_collect or nonce > 0:
-        if fetch_nonce:
+        if refresh_nonce:
             with st.spinner("正在刷新 Skill 热点数据..."):
-                groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=fetch_nonce)
+                groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=query_nonce)
             st.session_state["skillhot_nonce_applied"] = nonce
         else:
-            groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=0)
+            groups, fetch_errors = fetch_skill_hotspots(seed_groups=seed_groups, nonce=query_nonce)
     used_stale_snapshot = STALE_SKILLHOT_SNAPSHOT_MARK in fetch_errors
     fetch_errors = [x for x in fetch_errors if x != STALE_SKILLHOT_SNAPSHOT_MARK]
 
@@ -2890,18 +2897,19 @@ def render_ai_news_tab(data: dict | None = None) -> None:
             st.session_state["news_nonce"] = int(st.session_state.get("news_nonce", 0)) + 1
     nonce = int(st.session_state.get("news_nonce", 0))
     nonce_applied = int(st.session_state.get("news_nonce_applied", 0))
-    fetch_nonce = nonce if nonce > nonce_applied else 0
+    refresh_nonce = nonce if nonce > nonce_applied else 0
+    query_nonce = nonce if nonce > 0 else 0
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
     _sync_share_query(tab=AI_NEWS_TAB, keyword=keyword)
     include_community = not bool(quick_mode)
     active_feeds = _active_news_feeds(include_community=include_community)
-    if fetch_nonce:
+    if refresh_nonce:
         with st.spinner("正在刷新前线快报..."):
-            events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=fetch_nonce)
+            events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=query_nonce)
         st.session_state["news_nonce_applied"] = nonce
     else:
-        events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=0)
+        events, errors = fetch_ai_news(max_per_feed=max_per_feed, include_community=include_community, nonce=query_nonce)
     used_stale_snapshot = STALE_NEWS_SNAPSHOT_MARK in errors
     errors = [x for x in errors if x != STALE_NEWS_SNAPSHOT_MARK]
 
