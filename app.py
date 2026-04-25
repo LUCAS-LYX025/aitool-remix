@@ -371,40 +371,6 @@ def _get_query_params() -> dict[str, str]:
         return {}
 
 
-def _set_query_params(params: dict[str, str]) -> None:
-    clean = {str(k): str(v).strip() for k, v in params.items() if str(k).strip() and str(v).strip()}
-    current = _get_query_params()
-    if current == clean:
-        return
-
-    try:
-        st.experimental_set_query_params(**clean)
-        return
-    except Exception:
-        pass
-
-    try:
-        qp = st.query_params
-        for key in list(qp.keys()):
-            if key not in clean:
-                del qp[key]
-        for key, value in clean.items():
-            qp[key] = value
-    except Exception:
-        return
-
-
-def _sync_share_query(tab: str, category: str = "", keyword: str = "", ann_section: str = "") -> None:
-    params: dict[str, str] = {"tab": str(tab).strip()}
-    if category and category != "全部":
-        params["category"] = str(category).strip()
-    if keyword.strip():
-        params["q"] = keyword.strip()
-    if ann_section.strip():
-        params["ann"] = ann_section.strip()
-    _set_query_params(params)
-
-
 def _hydrate_state_from_query(data: dict) -> None:
     params = _get_query_params()
     if not params:
@@ -2526,7 +2492,6 @@ def render_announcement(data: dict) -> None:
 
     active = st.sidebar.radio("公告菜单", labels, key="ann_label")
     current = ann_map[active]
-    _sync_share_query(tab="公告", ann_section=str(current.get("id", "")).strip())
     title = escape(str(current.get("title", "公告")))
     intro = escape(str(current.get("intro", ""))).replace("\n", "<br/>")
     bullets = current.get("bullets", []) or []
@@ -2804,8 +2769,6 @@ def render_tools(data: dict, tab: str) -> None:
         st.session_state["category_by_tab"][tab] = selected
 
     search = st.text_input("搜索", key="search", placeholder=f"在「{tab}」下搜索名称、描述、标签")
-    _sync_share_query(tab=tab, category=selected or "", keyword=search)
-
     filtered = filter_items(items, search, selected)
     path = f"{tab} / {selected}" if selected else tab
     st.caption(f"当前路径：{path} · 结果：{len(filtered)} / {len(items)}")
@@ -2901,7 +2864,6 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     query_nonce = nonce if nonce > 0 else 0
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
-    _sync_share_query(tab=AI_NEWS_TAB, keyword=keyword)
     include_community = not bool(quick_mode)
     active_feeds = _active_news_feeds(include_community=include_community)
     if refresh_nonce:
@@ -3189,8 +3151,6 @@ def render_ai_news_tab(data: dict | None = None) -> None:
 def render_test_toolset_tab() -> None:
     st.subheader("测试工程师常用工具集")
     st.caption("点击卡片即可跳转到工具集站点。")
-    _sync_share_query(tab=TEST_TOOLSET_TAB)
-
     card_html = (
         f"<a class='card-link' href='{_safe_href(TEST_TOOLSET_URL)}' target='_self' rel='noopener noreferrer'>"
         "<article class='card-wrap'>"
