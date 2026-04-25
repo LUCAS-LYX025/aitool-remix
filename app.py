@@ -181,6 +181,24 @@ def get_hostname(url: str) -> str:
         return ""
 
 
+def _is_safe_http_url(url: str) -> bool:
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _safe_href(url: str, fallback: str = "#") -> str:
+    raw = str(url or "").strip()
+    if _is_safe_http_url(raw):
+        return escape(raw, quote=True)
+    return escape(fallback, quote=True)
+
+
 def favicon_primary(url: str) -> str:
     # First choice: website's own favicon (actual site icon).
     host = get_hostname(url)
@@ -322,6 +340,353 @@ def section_payload(data: dict, tab: str) -> tuple[list[dict], list[str]]:
         "软件测试学习网站": (data.get("learningSites", []), []),
     }
     return mapping.get(tab, ([], []))
+
+
+def _first_query_value(value: object) -> str:
+    if isinstance(value, list):
+        return str(value[0]).strip() if value else ""
+    if isinstance(value, tuple):
+        return str(value[0]).strip() if value else ""
+    return str(value or "").strip()
+
+
+def _get_query_params() -> dict[str, str]:
+    try:
+        raw = st.experimental_get_query_params()
+        if isinstance(raw, dict):
+            return {str(k): _first_query_value(v) for k, v in raw.items() if str(k).strip()}
+    except Exception:
+        pass
+
+    try:
+        qp = st.query_params
+        out: dict[str, str] = {}
+        for key in list(qp.keys()):
+            try:
+                out[str(key)] = _first_query_value(qp.get(key))
+            except Exception:
+                out[str(key)] = _first_query_value(qp[key])
+        return {k: v for k, v in out.items() if k.strip()}
+    except Exception:
+        return {}
+
+
+def _set_query_params(params: dict[str, str]) -> None:
+    clean = {str(k): str(v).strip() for k, v in params.items() if str(k).strip() and str(v).strip()}
+    current = _get_query_params()
+    if current == clean:
+        return
+
+    try:
+        st.experimental_set_query_params(**clean)
+        return
+    except Exception:
+        pass
+
+    try:
+        qp = st.query_params
+        for key in list(qp.keys()):
+            if key not in clean:
+                del qp[key]
+        for key, value in clean.items():
+            qp[key] = value
+    except Exception:
+        return
+
+
+def _sync_share_query(tab: str, category: str = "", keyword: str = "", ann_section: str = "") -> None:
+    params: dict[str, str] = {"tab": str(tab).strip()}
+    if category and category != "全部":
+        params["category"] = str(category).strip()
+    if keyword.strip():
+        params["q"] = keyword.strip()
+    if ann_section.strip():
+        params["ann"] = ann_section.strip()
+    _set_query_params(params)
+
+
+def _hydrate_state_from_query(data: dict) -> None:
+    params = _get_query_params()
+    if not params:
+        return
+
+    tabs = [str(x) for x in (data.get("tabs") or [])]
+    requested_tab = params.get("tab", "").strip()
+    active_tab = requested_tab if requested_tab in tabs else str(st.session_state.get("active_tab", "")).strip()
+    if requested_tab in tabs:
+        st.session_state["active_tab"] = requested_tab
+
+    keyword = params.get("q", "").strip()
+    if keyword:
+        if active_tab == AI_NEWS_TAB:
+            st.session_state["news_keyword"] = keyword
+        else:
+            st.session_state["search"] = keyword
+
+    category = params.get("category", "").strip()
+    if category and active_tab:
+        _, categories = section_payload(data, active_tab)
+        valid_categories = {"全部", *[str(x) for x in categories]}
+        if category in valid_categories:
+            st.session_state.setdefault("category_by_tab", {})
+            st.session_state["category_by_tab"][active_tab] = category
+            st.session_state[f"category_{active_tab}"] = category
+
+    ann_section = params.get("ann", "").strip()
+    if ann_section:
+        sections = data.get("announcement", {}).get("sections", []) or []
+        for section in sections:
+            sid = str(section.get("id", "")).strip()
+            if sid != ann_section:
+                continue
+            st.session_state["ann_section"] = sid
+            label = str(section.get("label", "")).strip()
+            if label:
+                st.session_state["ann_label"] = label
+            break
+
+
+def _compare_price(item: dict) -> str:
+    compare = item.get("compare", {})
+    if isinstance(compare, dict):
+        value = compare.get("price")
+        if isinstance(value, (str, int, float)):
+            text = str(value).strip()
+            if text:
+                return text
+
+    tags = [str(x).strip().lower() for x in (item.get("tags", []) or []) if str(x).strip()]
+    tag_blob = " ".join(tags)
+    for key in ("priceModel", "pricing", "price", "billing"):
+        value = str(item.get(key, "")).strip()
+        if value:
+            return value
+    if any(x in tag_blob for x in ("免费", "free", "trial", "试用")):
+        if "试用" in tag_blob or "trial" in tag_blob:
+            return "免费试用"
+        return "免费"
+    if "开源" in tag_blob or "open source" in tag_blob or "opensource" in tag_blob:
+        return "免费/开源"
+    if any(x in tag_blob for x in ("付费", "收费", "订阅", "pro")):
+        return "付费"
+    blob = text_blob(item)
+    if any(x in blob for x in ("免费试用", "trial", "free trial")):
+        return "免费试用"
+    if any(x in blob for x in ("开源", "免费", "free", "opensource", "open source")):
+        return "免费/开源"
+    if any(x in blob for x in ("付费", "收费", "订阅", "pro", "subscription")):
+        return "付费"
+    return "待补充"
+
+
+def _compare_flag(
+    item: dict,
+    keys: tuple[str, ...],
+    positive: tuple[str, ...],
+    negative: tuple[str, ...],
+    compare_key: str = "",
+) -> str:
+    compare = item.get("compare", {})
+    if compare_key and isinstance(compare, dict) and compare_key in compare:
+        raw = compare.get(compare_key)
+        if isinstance(raw, bool):
+            return "是" if raw else "否"
+        text = str(raw or "").strip()
+        if text:
+            return text
+
+    tags = [str(x).strip().lower() for x in (item.get("tags", []) or []) if str(x).strip()]
+    tag_blob = " ".join(tags)
+    for key in keys:
+        if key not in item:
+            continue
+        raw = item.get(key)
+        if isinstance(raw, bool):
+            return "是" if raw else "否"
+        value = str(raw or "").strip().lower()
+        if not value:
+            continue
+        if value in {"yes", "true", "1", "y", "是", "支持"}:
+            return "是"
+        if value in {"no", "false", "0", "n", "否", "不支持"}:
+            return "否"
+        if value in {"partial", "partly", "limited", "部分"}:
+            return "部分"
+        return str(raw).strip()
+
+    if any(k in tag_blob for k in positive):
+        return "是"
+    if any(k in tag_blob for k in negative):
+        return "否"
+
+    blob = text_blob(item)
+    if any(k in blob for k in positive):
+        return "是"
+    if any(k in blob for k in negative):
+        return "否"
+    return "待补充"
+
+
+def _compare_scenarios(item: dict) -> str:
+    compare = item.get("compare", {})
+    if isinstance(compare, dict):
+        compare_scenarios = compare.get("scenarios")
+        if isinstance(compare_scenarios, list):
+            values = [str(x).strip() for x in compare_scenarios if str(x).strip()]
+            if values:
+                return " / ".join(values[:3])
+        text = str(compare_scenarios or "").strip()
+        if text:
+            return text
+        alt_text = str(compare.get("scenario", "")).strip()
+        if alt_text:
+            return alt_text
+
+    for key in ("bestFor", "scenario", "scenarios", "useCases"):
+        value = item.get(key)
+        if isinstance(value, list):
+            lines = [str(x).strip() for x in value if str(x).strip()]
+            if lines:
+                return " / ".join(lines[:3])
+        text = str(value or "").strip()
+        if text:
+            return text
+
+    tags = item.get("tags", []) or []
+    if isinstance(tags, list):
+        skip = {"ai", "工具", "tool", "对话", "模型", "平台"}
+        picked: list[str] = []
+        for tag in tags:
+            text = str(tag).strip()
+            if not text:
+                continue
+            if text.lower() in skip:
+                continue
+            picked.append(text)
+            if len(picked) >= 3:
+                break
+        if picked:
+            return " / ".join(picked)
+    return "待补充"
+
+
+def _render_compare_panel(tab: str, filtered_items: list[dict]) -> None:
+    label_to_item: dict[str, dict] = {}
+    option_labels: list[str] = []
+    for idx, item in enumerate(filtered_items, start=1):
+        name = str(item.get("name", "未命名")).strip() or "未命名"
+        domain = get_domain(str(item.get("url", ""))) or "未知域名"
+        base = f"{name} · {domain}"
+        label = base
+        if label in label_to_item:
+            label = f"{base} ({idx})"
+        label_to_item[label] = item
+        option_labels.append(label)
+
+    compare_key = f"compare_selection_{tab}"
+    existing = st.session_state.get(compare_key, [])
+    if not isinstance(existing, list):
+        existing = []
+    st.session_state[compare_key] = [x for x in existing if x in option_labels][:3]
+
+    def _clear_compare_selection() -> None:
+        st.session_state[compare_key] = []
+
+    with st.expander("工具对比（Beta）", expanded=False):
+        st.caption("勾选 2-3 个工具后，按价格 / 开源 / API / 中文支持 / 适用场景做横向对比。")
+        multiselect_kwargs = {
+            "label": "选择待对比工具",
+            "options": option_labels,
+            "key": compare_key,
+            "placeholder": "可多选，建议 2-3 个",
+            "help": "最多可选择 3 个工具进行横向对比。",
+        }
+        try:
+            selected_labels = st.multiselect(max_selections=3, **multiselect_kwargs)
+        except TypeError:
+            # Backward compatibility for older Streamlit versions.
+            selected_labels = st.multiselect(**multiselect_kwargs)
+            if len(selected_labels) > 3:
+                keep = selected_labels[:3]
+                selected_labels = keep
+                st.warning("最多对比 3 个工具，已保留前 3 个。")
+
+        selected_count = len(selected_labels)
+        st.caption(f"已选择 {selected_count}/3")
+        if selected_count > 0:
+            st.button(
+                "清空对比选择",
+                key=f"{compare_key}_clear",
+                on_click=_clear_compare_selection,
+            )
+
+        chosen = [(label, label_to_item[label]) for label in selected_labels if label in label_to_item]
+        if 0 < len(chosen) < 2:
+            st.info("至少选择 2 个工具后显示对比结果。")
+            return
+        if len(chosen) < 2:
+            return
+
+        metric_rows: list[tuple[str, dict[str, str]]] = []
+        hidden_metrics: list[str] = []
+        strict_metrics = {"价格", "开源", "API", "中文支持"}
+        metrics = ("价格", "开源", "API", "中文支持", "适用场景", "官网")
+
+        def _is_unknown(value: str) -> bool:
+            text = str(value or "").strip()
+            return text in {"", "待补充", "未知", "N/A", "-"}
+
+        for metric in metrics:
+            row: dict[str, str] = {}
+            for label, item in chosen:
+                if metric == "价格":
+                    row[label] = _compare_price(item)
+                elif metric == "开源":
+                    row[label] = _compare_flag(
+                        item,
+                        keys=("openSource", "isOpenSource"),
+                        positive=("开源", "open source", "opensource", "github", "apache", "mit"),
+                        negative=("闭源", "closed source", "proprietary", "商业版"),
+                        compare_key="openSource",
+                    )
+                elif metric == "API":
+                    row[label] = _compare_flag(
+                        item,
+                        keys=("apiSupport", "hasApi"),
+                        positive=("api", "sdk", "开发者", "developer", "接口", "rest"),
+                        negative=("无api", "no api"),
+                        compare_key="api",
+                    )
+                elif metric == "中文支持":
+                    row[label] = _compare_flag(
+                        item,
+                        keys=("chineseSupport", "zhSupport"),
+                        positive=("中文", "国产", "国内", "china", "zh"),
+                        negative=("english only", "仅英文", "英文", "english"),
+                        compare_key="chinese",
+                    )
+                elif metric == "适用场景":
+                    row[label] = _compare_scenarios(item)
+                else:
+                    row[label] = get_domain(str(item.get("url", ""))) or "待补充"
+
+            values = [row[label] for label, _ in chosen]
+            if metric in strict_metrics and all(_is_unknown(v) for v in values):
+                hidden_metrics.append(metric)
+                continue
+            metric_rows.append((metric, row))
+
+        rows: list[dict[str, str]] = []
+        for metric, value_map in metric_rows:
+            row: dict[str, str] = {"对比维度": metric}
+            for label, _ in chosen:
+                row[label] = value_map.get(label, "待补充")
+            rows.append(row)
+
+        st.table(rows)
+        st.caption(f"当前对比：{len(chosen)} 个工具")
+        if hidden_metrics:
+            st.caption(f"已隐藏缺少有效数据的维度：{', '.join(hidden_metrics)}")
 
 
 def _strip_html(text: str) -> str:
@@ -629,19 +994,46 @@ def _write_skill_hotspots_snapshot(groups: list[dict]) -> None:
         return
 
 
-def _install_skillhot_auto_refresh(interval_ms: int = SKILL_HOTSPOT_REFRESH_INTERVAL_MS) -> None:
+def _sync_auto_refresh_scope(active_tab: str) -> None:
+    tab_value = json.dumps(str(active_tab), ensure_ascii=False)
+    news_tab_value = json.dumps(AI_NEWS_TAB, ensure_ascii=False)
+    skill_tab_value = json.dumps("Skill", ensure_ascii=False)
     components.html(
         f"""
         <script>
         (function() {{
+            const host = window.parent || window;
+            host.__lucas_active_tab__ = {tab_value};
+            if (host.__lucas_active_tab__ !== {news_tab_value} && host.__lucas_news_autorefresh_timer__) {{
+                host.clearTimeout(host.__lucas_news_autorefresh_timer__);
+                host.__lucas_news_autorefresh_timer__ = null;
+            }}
+            if (host.__lucas_active_tab__ !== {skill_tab_value} && host.__lucas_skillhot_autorefresh_timer__) {{
+                host.clearTimeout(host.__lucas_skillhot_autorefresh_timer__);
+                host.__lucas_skillhot_autorefresh_timer__ = null;
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def _install_skillhot_auto_refresh(active_tab: str, interval_ms: int = SKILL_HOTSPOT_REFRESH_INTERVAL_MS) -> None:
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const host = window.parent || window;
+            const activeTab = {json.dumps(str(active_tab), ensure_ascii=False)};
             const key = "__lucas_skillhot_autorefresh_timer__";
-            if (window[key]) return;
-            window[key] = window.setTimeout(function() {{
-                try {{
-                    window.parent.location.reload();
-                }} catch (e) {{
-                    window.location.reload();
-                }}
+            host.__lucas_active_tab__ = activeTab;
+            if (host[key]) {{
+                host.clearTimeout(host[key]);
+            }}
+            host[key] = host.setTimeout(function() {{
+                if (host.__lucas_active_tab__ !== activeTab) return;
+                host.location.reload();
             }}, {int(interval_ms)});
         }})();
         </script>
@@ -1047,20 +1439,22 @@ def _write_news_snapshot(include_community: bool, events: list[dict]) -> None:
         return
 
 
-def _install_news_auto_refresh(interval_ms: int = NEWS_AUTO_REFRESH_INTERVAL_MS) -> None:
+def _install_news_auto_refresh(active_tab: str, interval_ms: int = NEWS_AUTO_REFRESH_INTERVAL_MS) -> None:
     # Client-side timed page refresh while this tab is open.
     components.html(
         f"""
         <script>
         (function() {{
+            const host = window.parent || window;
+            const activeTab = {json.dumps(str(active_tab), ensure_ascii=False)};
             const key = "__lucas_news_autorefresh_timer__";
-            if (window[key]) return;
-            window[key] = window.setTimeout(function() {{
-                try {{
-                    window.parent.location.reload();
-                }} catch (e) {{
-                    window.location.reload();
-                }}
+            host.__lucas_active_tab__ = activeTab;
+            if (host[key]) {{
+                host.clearTimeout(host[key]);
+            }}
+            host[key] = host.setTimeout(function() {{
+                if (host.__lucas_active_tab__ !== activeTab) return;
+                host.location.reload();
             }}, {int(interval_ms)});
         }})();
         </script>
@@ -1133,6 +1527,7 @@ def ensure_state(data: dict) -> None:
     st.session_state.setdefault("news_nonce_applied", 0)
     st.session_state.setdefault("skillhot_nonce", 0)
     st.session_state.setdefault("skillhot_nonce_applied", 0)
+    st.session_state.setdefault("url_state_initialized", False)
 
     tabs = data.get("tabs", [])
     if st.session_state["active_tab"] not in tabs and tabs:
@@ -1141,6 +1536,9 @@ def ensure_state(data: dict) -> None:
     ann_sections = data.get("announcement", {}).get("sections", [])
     default_ann = ann_sections[0]["id"] if ann_sections else ""
     st.session_state.setdefault("ann_section", default_ann)
+    if not bool(st.session_state.get("url_state_initialized")):
+        _hydrate_state_from_query(data)
+        st.session_state["url_state_initialized"] = True
 
 
 def render_header(meta: dict) -> None:
@@ -2122,12 +2520,13 @@ def render_announcement(data: dict) -> None:
 
     active = st.sidebar.radio("公告菜单", labels, key="ann_label")
     current = ann_map[active]
+    _sync_share_query(tab="公告", ann_section=str(current.get("id", "")).strip())
     title = escape(str(current.get("title", "公告")))
     intro = escape(str(current.get("intro", ""))).replace("\n", "<br/>")
     bullets = current.get("bullets", []) or []
     footer = escape(str(current.get("footer", ""))) if current.get("footer") else ""
     cta_text = escape(str(current.get("ctaText", ""))) if current.get("ctaText") else ""
-    cta_url = escape(str(current.get("ctaUrl", "")), quote=True) if current.get("ctaUrl") else ""
+    cta_url = _safe_href(str(current.get("ctaUrl", ""))) if current.get("ctaUrl") else ""
 
     bullet_html = "".join(
         f"<li><span class='ann-no'>{idx:02d}</span><span class='ann-line'>{escape(str(line))}</span></li>"
@@ -2136,7 +2535,7 @@ def render_announcement(data: dict) -> None:
     footer_html = f"<div class='ann-footer'>{footer}</div>" if footer else ""
     cta_html = (
         f"<div class='ann-cta-wrap'><a class='ann-cta-btn' href='{cta_url}' target='_self' rel='noopener noreferrer'>{cta_text}</a></div>"
-        if cta_text and cta_url
+        if cta_text and cta_url != "#"
         else ""
     )
 
@@ -2290,7 +2689,7 @@ def render_skill_hotspots(data: dict) -> None:
             st.session_state["skillhot_nonce"] = int(st.session_state.get("skillhot_nonce", 0)) + 1
 
     if auto_collect:
-        _install_skillhot_auto_refresh()
+        _install_skillhot_auto_refresh(active_tab="Skill")
         _bump_skillhot_nonce_if_new_window()
 
     nonce = int(st.session_state.get("skillhot_nonce", 0))
@@ -2326,11 +2725,12 @@ def render_skill_hotspots(data: dict) -> None:
             star = escape(str(item.get("star", "N/A")))
             desc = escape(str(item.get("summary", "暂无说明")))
             download_url = str(item.get("downloadUrl", "")).strip()
+            download_href = _safe_href(download_url)
             download_cmd = escape(str(item.get("downloadCmd", "")).strip())
             fresh_at = escape(str(item.get("freshAt", "")).strip())
             download_html = (
-                f"<a href='{escape(download_url, quote=True)}' target='_blank' rel='noopener noreferrer'>下载地址</a>"
-                if download_url
+                f"<a href='{download_href}' target='_blank' rel='noopener noreferrer'>下载地址</a>"
+                if download_href != "#"
                 else "下载地址待补充"
             )
             scenarios = item.get("scenarios", []) or []
@@ -2397,6 +2797,7 @@ def render_tools(data: dict, tab: str) -> None:
         st.session_state["category_by_tab"][tab] = selected
 
     search = st.text_input("搜索", key="search", placeholder=f"在「{tab}」下搜索名称、描述、标签")
+    _sync_share_query(tab=tab, category=selected or "", keyword=search)
 
     filtered = filter_items(items, search, selected)
     path = f"{tab} / {selected}" if selected else tab
@@ -2406,12 +2807,14 @@ def render_tools(data: dict, tab: str) -> None:
         st.warning("没有匹配项，试试更短关键词或切换分类。")
         return
 
+    _render_compare_panel(tab=tab, filtered_items=filtered)
+
     local_icons = load_local_icon_data_uri()
     name_overrides = load_icon_name_overrides()
     col_html = ["", "", ""]
     for i, item in enumerate(filtered):
         item_name = escape(item.get("name", "未命名"))
-        item_url = escape(item.get("url", ""), quote=True)
+        item_url = _safe_href(item.get("url", ""))
         item_domain = escape(get_domain(item.get("url", "")))
         forced_icon = specific_icon_override(item, local=local_icons, name_overrides=name_overrides)
         icon_primary = escape(forced_icon, quote=True) if forced_icon else escape(
@@ -2459,7 +2862,7 @@ def render_tools(data: dict, tab: str) -> None:
 
 
 def render_ai_news_tab(data: dict | None = None) -> None:
-    _install_news_auto_refresh()
+    _install_news_auto_refresh(active_tab=AI_NEWS_TAB)
     _bump_news_nonce_if_new_window()
 
     st.subheader(AI_NEWS_TAB)
@@ -2490,6 +2893,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     fetch_nonce = nonce if nonce > nonce_applied else 0
 
     keyword = st.text_input("关键词筛选", key="news_keyword", placeholder="例如：OpenAI / Agent / 模型 / 论文")
+    _sync_share_query(tab=AI_NEWS_TAB, keyword=keyword)
     include_community = not bool(quick_mode)
     active_feeds = _active_news_feeds(include_community=include_community)
     if fetch_nonce:
@@ -2529,10 +2933,14 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         ts = float(ev.get("timestamp", 0) or 0)
         if keep_seconds and ts and now_ts - ts > keep_seconds:
             continue
-        if source_options and selected_sources:
+        if source_options:
+            if not selected_sources:
+                continue
             if not any(src in selected_sources for src in ev.get("sources", [])):
                 continue
-        if region_options and selected_regions:
+        if region_options:
+            if not selected_regions:
+                continue
             if not any(region in selected_regions for region in ev.get("regions", [])):
                 continue
         if key:
@@ -2582,7 +2990,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         ticker_seed = breaking_events * 2 if len(breaking_events) > 1 else breaking_events
         ticker_html = "".join(
             (
-                f"<a class='breaking-item' href='{escape(str(ev.get('link', '')), quote=True)}' target='_blank' rel='noopener noreferrer'>"
+                f"<a class='breaking-item' href='{_safe_href(str(ev.get('link', '')))}' target='_blank' rel='noopener noreferrer'>"
                 + (
                     "<span class='breaking-hot'>沸点</span>"
                     if int(ev.get("heat_score", 0)) >= 1000
@@ -2623,10 +3031,11 @@ def render_ai_news_tab(data: dict | None = None) -> None:
                 "</article>"
             )
             url = str(ev.get("url", "")).strip()
-            if not url:
+            url_href = _safe_href(url)
+            if url_href == "#":
                 return body
             return (
-                f"<a class='countdown-link' href='{escape(url, quote=True)}' target='_blank' rel='noopener noreferrer'>"
+                f"<a class='countdown-link' href='{url_href}' target='_blank' rel='noopener noreferrer'>"
                 f"{body}"
                 "</a>"
             )
@@ -2647,7 +3056,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         topic_cls = " dual" if topic == "Claude + Codex" else (" codex" if topic == "Codex" else "")
         related = int(ev.get("related_count", 0))
         related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
-        link = escape(str(ev.get("link", "")), quote=True)
+        link = _safe_href(str(ev.get("link", "")))
         return (
             f"<a class='card-link hot-card-link' href='{link}' target='_blank' rel='noopener noreferrer'>"
             f"<article class='hot-card agent-hot-card'>"
@@ -2698,7 +3107,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
         cross_tag = "<span class='hot-tag'>跨源讨论</span>" if int(ev.get("source_mentions", 1)) > 1 else ""
         related = int(ev.get("related_count", 0))
         related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
-        link = escape(str(ev.get("link", "")), quote=True)
+        link = _safe_href(str(ev.get("link", "")))
         return (
             f"<a class='card-link hot-card-link' href='{link}' target='_blank' rel='noopener noreferrer'>"
             f"<article class='hot-card'>"
@@ -2742,7 +3151,7 @@ def render_ai_news_tab(data: dict | None = None) -> None:
     def _timeline_item(ev: dict) -> str:
         related = int(ev.get("related_count", 0))
         related_html = f"<div class='timeline-related'>其他{related}家媒体也报道了</div>" if related > 0 else ""
-        link = escape(str(ev.get("link", "")), quote=True)
+        link = _safe_href(str(ev.get("link", "")))
         return (
             f"<article class='timeline-item'>"
             f"<div class='hot-meta-line'>"
@@ -2772,9 +3181,10 @@ def render_ai_news_tab(data: dict | None = None) -> None:
 def render_test_toolset_tab() -> None:
     st.subheader("测试工程师常用工具集")
     st.caption("点击卡片即可跳转到工具集站点。")
+    _sync_share_query(tab=TEST_TOOLSET_TAB)
 
     card_html = (
-        f"<a class='card-link' href='{escape(TEST_TOOLSET_URL, quote=True)}' target='_self' rel='noopener noreferrer'>"
+        f"<a class='card-link' href='{_safe_href(TEST_TOOLSET_URL)}' target='_self' rel='noopener noreferrer'>"
         "<article class='card-wrap'>"
         "<div class='card-top'>"
         "<div class='card-left'>"
@@ -2820,6 +3230,7 @@ def main() -> None:
     if active_tab != st.session_state.get("active_tab"):
         st.session_state["search"] = ""
     st.session_state["active_tab"] = active_tab
+    _sync_auto_refresh_scope(active_tab)
 
     if active_tab == "公告":
         render_announcement(data)
